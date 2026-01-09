@@ -412,7 +412,7 @@ async def oai_get_bytes(path: str) -> tuple[bytes | None, str | None]:
         return None, str(e)
 
 async def generate_image(prompt: str, size: str = "1024x1024") -> tuple[bytes | None, str | None]:
-    # Correct endpoint: /v1/images/generations :contentReference[oaicite:2]{index=2}
+    # Correct endpoint: /v1/images/generations  [oai_citation:2‡OpenAI Platform](https://platform.openai.com/docs/api-reference/videos)
     payload = {
         "model": IMAGE_MODEL,
         "prompt": prompt,
@@ -436,7 +436,7 @@ async def generate_image(prompt: str, size: str = "1024x1024") -> tuple[bytes | 
         return None, f"Parse error: {e}"
 
 async def create_video_job(prompt: str, seconds: int = 4, size: str = "720x1280") -> tuple[str | None, str | None]:
-    # Videos endpoint: POST /v1/videos :contentReference[oaicite:3]{index=3}
+    # Videos endpoint: POST /v1/videos  [oai_citation:3‡OpenAI Platform](https://platform.openai.com/docs/api-reference/videos)
     url = f"{OPENAI_BASE}/videos"
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -470,7 +470,7 @@ async def wait_video_done(video_id: str, max_wait_sec: int = 120) -> tuple[bool,
     return False, "Timeout waiting video"
 
 async def download_video(video_id: str) -> tuple[bytes | None, str | None]:
-    # GET /v1/videos/{id}/content :contentReference[oaicite:4]{index=4}
+    # GET /v1/videos/{id}/content  [oai_citation:4‡OpenAI Platform](https://platform.openai.com/docs/api-reference/videos)
     return await oai_get_bytes(f"/videos/{video_id}/content")
 
 async def chat_answer(user_text: str) -> tuple[str | None, str | None]:
