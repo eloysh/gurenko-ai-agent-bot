@@ -226,17 +226,27 @@ def log_payment(tg_id: int, charge_id: str, payload: str):
 # ============================
 oai = OpenAI(api_key=OPENAI_API_KEY)
 
+import asyncio
+
 async def ask_openai(question: str) -> str:
-    # Responses API is the recommended API interface.
-    resp = oai.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ],
-    )
-    text = getattr(resp, "output_text", None)
-    return text.strip() if text else "Не удалось получить ответ. Попробуй ещё раз."
+    def _call():
+        # Работает в openai-python 1.x даже если нет client.responses
+        return oai.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            temperature=0.7,
+        )
+
+    try:
+        resp = await asyncio.to_thread(_call)
+        text = resp.choices[0].message.content or ""
+        return text.strip() or "Пустой ответ. Попробуй переформулировать запрос."
+    except Exception as e:
+        # Важно: чтобы бот не зависал на “Думаю…”
+        return f"⚠️ Ошибка при обращении к GPT: {type(e).__name__}. Проверь Render → Logs."
 
 # ============================
 # Telegram UI
