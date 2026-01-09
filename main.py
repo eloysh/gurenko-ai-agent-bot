@@ -1,7 +1,9 @@
 import os
 import sqlite3
+import asyncio
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request
 from telegram import (
@@ -21,6 +23,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 from openai import OpenAI
 
 # ============================
@@ -28,7 +31,7 @@ from openai import OpenAI
 # ============================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # safe default
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 TG_CHANNEL = os.getenv("TG_CHANNEL", "@gurenko_kristina_ai")
 TZ_NAME = os.getenv("TZ", "Asia/Tokyo")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "3"))
@@ -49,6 +52,59 @@ SYSTEM_PROMPT = """Ты — AI-агент Кристины.
 Если нужно — дай 1-2 примера промтов.
 Если вопрос про Reels — начинай с 'Хук/первые 2 секунды/формат/текст на экране'.
 """
+
+# ============================
+# PROMPT OF THE DAY (7 days loop)
+# ============================
+DAILY_PACK = [
+    {
+        "title": "День 1 — Анти-кукла (реалистичная кожа)",
+        "prompt": "Ultra-realistic close-up portrait, natural skin texture with pores and micro-details, subtle imperfections, realistic highlights, no beauty retouch. Identity locked to reference 1:1 (do not change facial structure). Soft cinematic lighting, 50mm, shallow DOF, 8K.",
+        "negative": "no smoothing, no wax skin, no doll face, no plastic skin, no enlarged eyes, no AI glamour, no face morph",
+        "tip": "Свет у окна + не завышай sharpness/clarity (иначе пластик).",
+    },
+    {
+        "title": "День 2 — Sora: видео 10 сек из 1 фото",
+        "prompt": "Cinematic 4K video, 9:16, 10 seconds. Identity locked 1:1 to the reference. Subtle head turn 5°, natural blink, micro-expressions, gentle breathing, slight hair movement from soft wind. Film grain, realistic motion blur.",
+        "negative": "no face morph, no jitter, no warping, no uncanny smile, no extra fingers, no distorted eyes",
+        "tip": "Движение делай микро — так меньше искажений.",
+    },
+    {
+        "title": "День 3 — Дорогой глянец (fashion-editorial)",
+        "prompt": "High-end fashion editorial portrait, clean studio background, softbox key light + gentle rim light, crisp detail, natural skin texture, luxury look, neutral grading, 85mm lens, f/2.0, 8K. Identity unchanged 1:1.",
+        "negative": "no glossy plastic skin, no overcontrast, no oversharpen, no heavy beauty filter",
+        "tip": "Нейтральный цвет + мягкий свет = «дорого».",
+    },
+    {
+        "title": "День 4 — Снег без CGI",
+        "prompt": "Ultra realistic winter portrait outdoors, gentle snowfall, snow crystals on hair and jacket, cold breath visible, natural skin texture preserved, cinematic lighting, realistic shadows, 8K. Identity locked 1:1.",
+        "negative": "no fake snow overlay, no CGI snow, no blur face, no skin smoothing, no face morph",
+        "tip": "Пиши ‘gentle snowfall’, не ‘heavy particles’.",
+    },
+    {
+        "title": "День 5 — Кино-кадр (тёплый интерьер)",
+        "prompt": "Cinematic portrait, warm amber practical lights in background (bokeh), soft key light, realistic skin pores, subtle film grain, 35mm lens, f/1.8, 8K, identity unchanged 1:1.",
+        "negative": "no orange skin, no harsh HDR, no beauty filter, no wax skin",
+        "tip": "Bokeh на фоне делает кадр «как кино».",
+    },
+    {
+        "title": "День 6 — 3 ракурса, одно лицо (1:1)",
+        "prompt": "Create three ultra-realistic portraits of the same person with identity preserved 1:1: (1) front, (2) 3/4, (3) profile. Keep facial proportions identical, consistent hairstyle, natural skin texture. Cinematic soft lighting, 8K.",
+        "negative": "no identity drift, no different person, no age change, no face morph, no doll face",
+        "tip": "Обязательно добавляй ‘same person’ + запрет identity drift.",
+    },
+    {
+        "title": "День 7 — Reels упаковка (под залёт)",
+        "prompt": "Сценарий 10 сек: 0–1с «Это 1 промт», 1–3с до/после, 3–6с «убираем куклу (negative)», 6–8с «пиши СНЕГ в бота», 8–10с CTA «подпишись на канал».",
+        "negative": "",
+        "tip": "Текст на экране крупно (3–5 слов), первые 2 секунды — хук.",
+    },
+]
+
+def get_daily_item():
+    today = datetime.now(tz).date()
+    idx = today.toordinal() % len(DAILY_PACK)
+    return DAILY_PACK[idx]
 
 # ============================
 # DB (SQLite)
@@ -224,13 +280,10 @@ def log_payment(tg_id: int, charge_id: str, payload: str):
 # ============================
 # OpenAI
 # ============================
-oai = OpenAI(api_key=OPENAI_API_KEY)
-
-import asyncio
+oai = OpenAI(api_key=OPENAI_API_KEY, timeout=30, max_retries=2)
 
 async def ask_openai(question: str) -> str:
     def _call():
-        # Работает в openai-python 1.x даже если нет client.responses
         return oai.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
@@ -245,8 +298,8 @@ async def ask_openai(question: str) -> str:
         text = resp.choices[0].message.content or ""
         return text.strip() or "Пустой ответ. Попробуй переформулировать запрос."
     except Exception as e:
-        # Важно: чтобы бот не зависал на “Думаю…”
-        return f"⚠️ Ошибка при обращении к GPT: {type(e).__name__}. Проверь Render → Logs."
+        print("OpenAI error:", repr(e))
+        return "⚠️ Сейчас не получилось получить ответ от GPT. Попробуй ещё раз через минуту."
 
 # ============================
 # Telegram UI
@@ -254,13 +307,16 @@ async def ask_openai(question: str) -> str:
 def kb_subscribe():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Проверить подписку", callback_data="check_sub")],
+        [InlineKeyboardButton("👀 Показать пример результата", callback_data="sample")],
         [InlineKeyboardButton("📌 Что умеет бот", callback_data="about")],
     ])
 
 def kb_main():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Промт дня", callback_data="daily")],
         [InlineKeyboardButton("🎬 База промтов", callback_data="prompts")],
         [InlineKeyboardButton("🧠 Задать вопрос AI-агенту", callback_data="ask")],
+        [InlineKeyboardButton("📣 Поделиться ботом", callback_data="share")],
         [InlineKeyboardButton("⭐ VIP без лимитов", callback_data="vip")],
     ])
 
@@ -294,7 +350,6 @@ async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         member = await context.bot.get_chat_member(chat_id=TG_CHANNEL, user_id=user_id)
         return member.status in ("member", "administrator", "creator")
     except BadRequest:
-        # Usually means: bot isn't admin of the channel OR wrong channel handle.
         return False
     except Exception:
         return False
@@ -303,7 +358,6 @@ async def require_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     ok = await is_subscribed(update, context)
     if ok:
         return True
-    # reply in both message/callback contexts
     if update.message:
         await update.message.reply_text(
             f"Для доступа подпишись на канал {TG_CHANNEL} и нажми «Проверить подписку».",
@@ -324,7 +378,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(u.id, u.username)
     text = (
         "Привет! Я AI-бот Кристины 🤍\n\n"
-        "Здесь — промты и гайды по нейросетям (Sora/HeyGen/Meta AI) + ответы как ChatGPT.\n\n"
+        "Здесь — промты и гайды по нейросетям (Sora/HeyGen/Meta AI) + ответы как ChatGPT.\n"
+        "🎁 Есть «Промт дня».\n\n"
         f"✅ Чтобы открыть доступ — подпишись на канал: {TG_CHANNEL}\n"
         "Нажми «Проверить подписку»."
     )
@@ -369,7 +424,6 @@ async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def paysupport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Telegram recommends having /paysupport for payments support.
     await update.message.reply_text(
         "Поддержка по оплатам ⭐\n"
         "Если платеж прошёл, но VIP не включился — напиши сюда:\n"
@@ -403,13 +457,30 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    # доступны даже без подписки
     if data == "about":
         await query.edit_message_text(
             "Я умею:\n"
             "• Проверять подписку на канал\n"
+            "• Давать «Промт дня»\n"
             "• Выдавать базу промтов по кнопкам\n"
             "• Отвечать как AI-агент (с лимитом)\n"
             "• VIP без лимитов через Telegram Stars",
+            reply_markup=kb_subscribe()
+        )
+        return
+
+    if data == "sample":
+        await query.edit_message_text(
+            "👀 Пример результата (как выглядит ответ подписчикам):\n\n"
+            "<b>PROMPT:</b>\n"
+            "<code>Ультра-реалистичный портрет, натуральная текстура кожи (видны поры/микродетали), "
+            "без пластика и сглаживания. Личность 1:1, не менять форму лица/глаз/носа/губ. "
+            "Свет: мягкий key + лёгкий rim, 50mm, f/1.8, 8K.</code>\n\n"
+            "<b>NEGATIVE:</b>\n"
+            "<code>no face morph, no wax skin, no over-smoothing, no doll face, no beauty filter.</code>\n\n"
+            f"✅ Чтобы открыть всё меню и «Промт дня» — подпишись на {TG_CHANNEL} и нажми «Проверить подписку».",
+            parse_mode=ParseMode.HTML,
             reply_markup=kb_subscribe()
         )
         return
@@ -436,6 +507,28 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu":
         set_mode(u.id, "menu")
         await query.edit_message_text("Меню:", reply_markup=kb_main())
+        return
+
+    if data == "daily":
+        item = get_daily_item()
+        text = f"<b>{item['title']}</b>\n\n<b>PROMPT:</b>\n<code>{item['prompt']}</code>"
+        if item["negative"]:
+            text += f"\n\n<b>NEGATIVE:</b>\n<code>{item['negative']}</code>"
+        text += f"\n\n<b>Подсказка:</b> {item['tip']}\n\n🔑 Хочешь секретный промт? Напиши мне: <b>СНЕГ</b>"
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back_main())
+        return
+
+    if data == "share":
+        share_text = "Я пользуюсь AI-ботом Кристины: промты Sora/HeyGen/Meta AI + Промт дня 🤍"
+        bot_link = "https://t.me/gurenko_ai_agent_bot"
+        share_link = f"https://t.me/share/url?url={quote(bot_link)}&text={quote(share_text)}"
+        await query.edit_message_text(
+            "📣 Поделиться ботом:\nНажми кнопку ниже и отправь друзьям.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 Поделиться", url=share_link)],
+                [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+            ])
+        )
         return
 
     if data == "prompts":
@@ -480,8 +573,6 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "buy_vip":
         payload = f"vip_{u.id}_{int(datetime.now(tz).timestamp())}"
         prices = [LabeledPrice(label=f"VIP {VIP_DAYS} дней", amount=VIP_PRICE_STARS)]
-        # For Telegram Stars (XTR): provider_token should be empty / omitted depending on library.
-        # python-telegram-bot docs recommend passing empty string. If you get an error, set provider_token="0".
         await context.bot.send_invoice(
             chat_id=u.id,
             title="VIP-доступ",
@@ -518,11 +609,43 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_sub(update, context):
         return
 
+    txt = (update.message.text or "").strip()
+
+    # Секретное слово из канала
+    if txt.upper().startswith("СНЕГ"):
+        if "2" in txt:
+            await update.message.reply_text(
+                "❄️ СНЕГ 2 — 3 варианта под ракурсы (строго 1:1):\n\n"
+                "1) FRONT:\n"
+                "<code>Ultra-realistic winter fashion portrait, front view, identity locked 1:1, natural skin pores, soft key+rim, 50mm f/1.8, 8K.</code>\n\n"
+                "2) 3/4 (10°):\n"
+                "<code>Same person, 3/4 view, slight head turn 10°, micro-expressions, natural skin texture, cinematic light, 8K. Identity unchanged.</code>\n\n"
+                "3) PROFILE:\n"
+                "<code>Same person, profile view, identical facial proportions, natural skin texture, soft cinematic lighting, 8K. No identity drift.</code>\n\n"
+                "Нужно под конкретный инструмент? Напиши: Sora / Meta AI / HeyGen.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_main()
+            )
+        else:
+            await update.message.reply_text(
+                "🎁 Секретный промт «СНЕГ»:\n\n"
+                "<b>PROMPT:</b>\n"
+                "<code>Ультра-реалистичный зимний fashion-editorial портрет, натуральная текстура кожи, без пластика. "
+                "Сохранить личность 1:1 (не менять форму лица/глаз/носа/губ). Свет: мягкий key + rim, 50mm, f/1.8, 8K.</code>\n\n"
+                "<b>NEGATIVE:</b>\n"
+                "<code>no face morph, no wax skin, no over-smoothing, no doll face, no beauty filter, no identity drift.</code>\n\n"
+                "Хочешь 3 варианта под ракурсы? Напиши: <b>СНЕГ 2</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_main()
+            )
+        return
+
     row = get_user(u.id)
     mode = row["mode"] if row else "menu"
 
+    # если не в режиме ask — показываем меню (не ломаем UX)
     if mode != "ask":
-        await update.message.reply_text("Выбери действие в меню:", reply_markup=kb_main())
+        await update.message.reply_text("Выбирай в меню 👇", reply_markup=kb_main())
         return
 
     reset_if_needed(u.id)
@@ -538,7 +661,7 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    question = update.message.text.strip()
+    question = txt
     await update.message.reply_text("Думаю… 🤍")
 
     answer = await ask_openai(question)
