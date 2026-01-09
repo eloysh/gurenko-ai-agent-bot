@@ -101,20 +101,24 @@ DAILY_PACK = [
     },
 ]
 
+
 def get_daily_item():
     today = datetime.now(tz).date()
     idx = today.toordinal() % len(DAILY_PACK)
     return DAILY_PACK[idx]
+
 
 # ============================
 # DB (SQLite)
 # ============================
 DB_PATH = "data.db"
 
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     conn = db()
@@ -149,6 +153,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 def upsert_user(tg_id: int, username: str | None):
     conn = db()
     cur = conn.cursor()
@@ -167,6 +172,7 @@ def upsert_user(tg_id: int, username: str | None):
     conn.commit()
     conn.close()
 
+
 def get_user(tg_id: int):
     conn = db()
     cur = conn.cursor()
@@ -175,12 +181,14 @@ def get_user(tg_id: int):
     conn.close()
     return row
 
+
 def set_mode(tg_id: int, mode: str):
     conn = db()
     cur = conn.cursor()
     cur.execute("UPDATE users SET mode=? WHERE tg_id=?", (mode, tg_id))
     conn.commit()
     conn.close()
+
 
 def is_vip(row) -> bool:
     if not row:
@@ -192,6 +200,7 @@ def is_vip(row) -> bool:
         return datetime.fromisoformat(vu).replace(tzinfo=tz) > datetime.now(tz)
     except Exception:
         return False
+
 
 def reset_if_needed(tg_id: int):
     conn = db()
@@ -211,12 +220,14 @@ def reset_if_needed(tg_id: int):
         conn.commit()
     conn.close()
 
+
 def inc_usage(tg_id: int):
     conn = db()
     cur = conn.cursor()
     cur.execute("UPDATE users SET used_today = used_today + 1 WHERE tg_id=?", (tg_id,))
     conn.commit()
     conn.close()
+
 
 def set_vip(tg_id: int, days: int):
     until = (datetime.now(tz) + timedelta(days=days)).isoformat()
@@ -226,6 +237,7 @@ def set_vip(tg_id: int, days: int):
     conn.commit()
     conn.close()
 
+
 def seed_prompts_if_empty():
     conn = db()
     cur = conn.cursor()
@@ -233,15 +245,26 @@ def seed_prompts_if_empty():
     c = cur.fetchone()["c"]
     if c == 0:
         samples = [
-            ("Оживление фото", "Лицо 1:1 (без куклы)", "УЛЬТРА-реалистично, натуральная текстура кожи, без beauty-фильтров. Сохранить личность 1:1: не менять форму лица/глаз/носа/губ, не взрослить. Мягкий ключевой свет + лёгкий контровой, реалистичная оптика 50mm, shallow DOF. Негатив: no face morph, no wax skin, no over-smoothing."),
-            ("Sora", "Видео из 1 фото (10 сек)", "Cinematic 4K, 9:16, 10s. Subtle head turn 5°, natural blink, micro-expressions, breathing. Identity locked to reference. Soft film grain, realistic motion blur, no distortion."),
-            ("HeyGen", "Говорящая голова (15 сек)", "Friendly confident tone, slight smile. Clean studio lighting, natural skin texture, no over-sharpen. Script: 1 хук + 1 польза + CTA в Telegram."),
-            ("Suno", "Вирусный хук (12–18 сек)", "Modern pop/edm hook, 124 bpm, punchy drums, catchy topline, Russian lyrics, 1 hook line repeated. No kids choir."),
-            ("Reels-хуки", "3 хука на выбор", "1) 'Смотри, это сделано из 1 фото…' 2) 'Почему у всех лицо кукла — и как исправить' 3) 'Хочешь промт? Напиши ПРОМТ'"),
+            ("Оживление фото", "Лицо 1:1 (без куклы)",
+             "УЛЬТРА-реалистично, натуральная текстура кожи, без beauty-фильтров. "
+             "Сохранить личность 1:1: не менять форму лица/глаз/носа/губ, не взрослить. "
+             "Мягкий ключевой свет + лёгкий контровой, реалистичная оптика 50mm, shallow DOF. "
+             "Негатив: no face morph, no wax skin, no over-smoothing."),
+            ("Sora", "Видео из 1 фото (10 сек)",
+             "Cinematic 4K, 9:16, 10s. Subtle head turn 5°, natural blink, micro-expressions, breathing. "
+             "Identity locked to reference. Soft film grain, realistic motion blur, no distortion."),
+            ("HeyGen", "Говорящая голова (15 сек)",
+             "Friendly confident tone, slight smile. Clean studio lighting, natural skin texture, no over-sharpen. "
+             "Script: 1 хук + 1 польза + CTA в Telegram."),
+            ("Suno", "Вирусный хук (12–18 сек)",
+             "Modern pop/edm hook, 124 bpm, punchy drums, catchy topline, Russian lyrics, 1 hook line repeated. No kids choir."),
+            ("Reels-хуки", "3 хука на выбор",
+             "1) 'Смотри, это сделано из 1 фото…' 2) 'Почему у всех лицо кукла — и как исправить' 3) 'Хочешь промт? Напиши ПРОМТ'"),
         ]
         cur.executemany("INSERT INTO prompts(category,title,body) VALUES (?,?,?)", samples)
         conn.commit()
     conn.close()
+
 
 def list_categories():
     conn = db()
@@ -251,6 +274,7 @@ def list_categories():
     conn.close()
     return cats
 
+
 def list_prompts(category: str):
     conn = db()
     cur = conn.cursor()
@@ -259,6 +283,7 @@ def list_prompts(category: str):
     conn.close()
     return rows
 
+
 def get_prompt(pid: int):
     conn = db()
     cur = conn.cursor()
@@ -266,6 +291,7 @@ def get_prompt(pid: int):
     r = cur.fetchone()
     conn.close()
     return r
+
 
 def log_payment(tg_id: int, charge_id: str, payload: str):
     conn = db()
@@ -277,10 +303,12 @@ def log_payment(tg_id: int, charge_id: str, payload: str):
     conn.commit()
     conn.close()
 
+
 # ============================
 # OpenAI
 # ============================
 oai = OpenAI(api_key=OPENAI_API_KEY, timeout=30, max_retries=2)
+
 
 async def ask_openai(question: str) -> str:
     def _call():
@@ -301,6 +329,7 @@ async def ask_openai(question: str) -> str:
         print("OpenAI error:", repr(e))
         return "⚠️ Сейчас не получилось получить ответ от GPT. Попробуй ещё раз через минуту."
 
+
 # ============================
 # Telegram UI
 # ============================
@@ -311,6 +340,7 @@ def kb_subscribe():
         [InlineKeyboardButton("📌 Что умеет бот", callback_data="about")],
     ])
 
+
 def kb_main():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎁 Промт дня", callback_data="daily")],
@@ -320,8 +350,10 @@ def kb_main():
         [InlineKeyboardButton("⭐ VIP без лимитов", callback_data="vip")],
     ])
 
+
 def kb_back_main():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]])
+
 
 def kb_categories():
     cats = list_categories()
@@ -329,17 +361,20 @@ def kb_categories():
     rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
 
+
 def kb_prompt_list(category: str):
     items = list_prompts(category)
     rows = [[InlineKeyboardButton(r["title"], callback_data=f"p:{r['id']}")] for r in items]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="prompts")])
     return InlineKeyboardMarkup(rows)
 
+
 def kb_vip_buy():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"⭐ Купить VIP на {VIP_DAYS} дней — {VIP_PRICE_STARS} Stars", callback_data="buy_vip")],
         [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
     ])
+
 
 # ============================
 # Helpers
@@ -354,6 +389,7 @@ async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     except Exception:
         return False
 
+
 async def require_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     ok = await is_subscribed(update, context)
     if ok:
@@ -364,11 +400,26 @@ async def require_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
             reply_markup=kb_subscribe()
         )
     elif update.callback_query:
-        await update.callback_query.edit_message_text(
+        await safe_edit(
+            update.callback_query,
             f"Для доступа подпишись на канал {TG_CHANNEL} и нажми «Проверить подписку».",
             reply_markup=kb_subscribe()
         )
     return False
+
+
+async def safe_edit(query, text: str, reply_markup=None, parse_mode=None):
+    """
+    Telegram ругается, когда мы пытаемся отредактировать сообщение тем же текстом/кнопками.
+    Эту ошибку безопасно игнорируем.
+    """
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            return
+        raise
+
 
 # ============================
 # Commands
@@ -385,6 +436,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, reply_markup=kb_subscribe())
 
+
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     upsert_user(u.id, u.username)
@@ -393,12 +445,14 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_mode(u.id, "menu")
     await update.message.reply_text("Меню:", reply_markup=kb_main())
 
+
 async def prompts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     upsert_user(u.id, u.username)
     if not await require_sub(update, context):
         return
     await update.message.reply_text("Выбери категорию промтов:", reply_markup=kb_categories())
+
 
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -410,6 +464,7 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ок ✅ Напиши свой вопрос одним сообщением.\n\nЛимит бесплатно: {DAILY_LIMIT}/день (VIP — без лимитов).",
         reply_markup=kb_back_main()
     )
+
 
 async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -423,6 +478,7 @@ async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb_vip_buy()
     )
 
+
 async def paysupport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Поддержка по оплатам ⭐\n"
@@ -433,6 +489,7 @@ async def paysupport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Мы проверим и включим доступ.",
         reply_markup=kb_main()
     )
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -446,6 +503,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb_main()
     )
 
+
 # ============================
 # Callbacks + Payments
 # ============================
@@ -457,9 +515,10 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # доступны даже без подписки
+    # доступно даже без подписки
     if data == "about":
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "Я умею:\n"
             "• Проверять подписку на канал\n"
             "• Давать «Промт дня»\n"
@@ -471,7 +530,8 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "sample":
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "👀 Пример результата (как выглядит ответ подписчикам):\n\n"
             "<b>PROMPT:</b>\n"
             "<code>Ультра-реалистичный портрет, натуральная текстура кожи (видны поры/микродетали), "
@@ -489,9 +549,10 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok = await is_subscribed(update, context)
         if ok:
             set_mode(u.id, "menu")
-            await query.edit_message_text("Доступ открыт ✅ Выбирай:", reply_markup=kb_main())
+            await safe_edit(query, "Доступ открыт ✅ Выбирай:", reply_markup=kb_main())
         else:
-            await query.edit_message_text(
+            await safe_edit(
+                query,
                 "Пока не вижу подписку 😕\n\n"
                 f"1) Подпишись на {TG_CHANNEL}\n"
                 "2) Вернись и нажми «Проверить подписку»\n\n"
@@ -506,7 +567,7 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu":
         set_mode(u.id, "menu")
-        await query.edit_message_text("Меню:", reply_markup=kb_main())
+        await safe_edit(query, "Меню:", reply_markup=kb_main())
         return
 
     if data == "daily":
@@ -515,14 +576,15 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if item["negative"]:
             text += f"\n\n<b>NEGATIVE:</b>\n<code>{item['negative']}</code>"
         text += f"\n\n<b>Подсказка:</b> {item['tip']}\n\n🔑 Хочешь секретный промт? Напиши мне: <b>СНЕГ</b>"
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back_main())
+        await safe_edit(query, text, parse_mode=ParseMode.HTML, reply_markup=kb_back_main())
         return
 
     if data == "share":
         share_text = "Я пользуюсь AI-ботом Кристины: промты Sora/HeyGen/Meta AI + Промт дня 🤍"
         bot_link = "https://t.me/gurenko_ai_agent_bot"
         share_link = f"https://t.me/share/url?url={quote(bot_link)}&text={quote(share_text)}"
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "📣 Поделиться ботом:\nНажми кнопку ниже и отправь друзьям.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📤 Поделиться", url=share_link)],
@@ -532,37 +594,40 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "prompts":
-        await query.edit_message_text("Выбери категорию промтов:", reply_markup=kb_categories())
+        await safe_edit(query, "Выбери категорию промтов:", reply_markup=kb_categories())
         return
 
     if data.startswith("cat:"):
         cat = data.split(":", 1)[1]
-        await query.edit_message_text(f"Категория: {cat}", reply_markup=kb_prompt_list(cat))
+        await safe_edit(query, f"Категория: {cat}", reply_markup=kb_prompt_list(cat))
         return
 
     if data.startswith("p:"):
         pid = int(data.split(":", 1)[1])
         p = get_prompt(pid)
         if not p:
-            await query.edit_message_text("Промт не найден.", reply_markup=kb_back_main())
+            await safe_edit(query, "Промт не найден.", reply_markup=kb_back_main())
             return
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             f"<b>{p['title']}</b>\n\n<code>{p['body']}</code>",
-            reply_markup=kb_back_main(),
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_back_main()
         )
         return
 
     if data == "ask":
         set_mode(u.id, "ask")
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             f"Ок ✅ Напиши свой вопрос одним сообщением.\n\nЛимит бесплатно: {DAILY_LIMIT}/день (VIP — без лимитов).",
             reply_markup=kb_back_main()
         )
         return
 
     if data == "vip":
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             f"VIP снимает лимиты и открывает быстрые шаблоны.\n"
             f"Срок: {VIP_DAYS} дней\n"
             f"Цена: {VIP_PRICE_STARS} Stars",
@@ -584,9 +649,11 @@ async def cbq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+
 async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.pre_checkout_query
     await q.answer(ok=True)
+
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -598,6 +665,7 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Можешь задавать вопросы без лимитов.",
         reply_markup=kb_main()
     )
+
 
 # ============================
 # Message handler
@@ -643,7 +711,6 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = get_user(u.id)
     mode = row["mode"] if row else "menu"
 
-    # если не в режиме ask — показываем меню (не ломаем UX)
     if mode != "ask":
         await update.message.reply_text("Выбирай в меню 👇", reply_markup=kb_main())
         return
@@ -661,13 +728,14 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    question = txt
     await update.message.reply_text("Думаю… 🤍")
+    answer = await ask_openai(txt)
 
-    answer = await ask_openai(question)
     if not vip:
         inc_usage(u.id)
+
     await update.message.reply_text(answer, reply_markup=kb_main())
+
 
 # ============================
 # FastAPI + Webhook
@@ -688,6 +756,7 @@ application.add_handler(PreCheckoutQueryHandler(precheckout))
 application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
 
+
 @app.on_event("startup")
 async def on_startup():
     init_db()
@@ -702,10 +771,12 @@ async def on_startup():
     else:
         print("WEBHOOK_BASE is empty. Set it in hosting env and redeploy to enable webhook.")
 
+
 @app.on_event("shutdown")
 async def on_shutdown():
     await application.stop()
     await application.shutdown()
+
 
 @app.post("/webhook")
 async def telegram_webhook(req: Request):
@@ -713,6 +784,7 @@ async def telegram_webhook(req: Request):
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return {"ok": True}
+
 
 @app.get("/")
 async def root():
