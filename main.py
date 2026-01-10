@@ -1,20 +1,20 @@
 import os
-import re
-import json
-import time
-import sqlite3
+import base64
 import logging
-import asyncio
-from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
-from typing import Optional, Tuple
+import sqlite3
+import time
+from datetime import datetime, timedelta
+from urllib.parse import quote
 
-import httpx
 from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
+
 from telegram import (
     Update,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     LabeledPrice,
 )
 from telegram.constants import ParseMode
@@ -22,732 +22,1043 @@ from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
     PreCheckoutQueryHandler,
     ContextTypes,
     filters,
 )
 
-# OpenAI SDK
-from openai import OpenAI
+# Optional OpenAI
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
 
+
+# -------------------- LOGGING --------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gurenko-bot")
 
-# -----------------------------
-# ENV (accept aliases)
-# -----------------------------
-def getenv_any(*names: str, default: str = "") -> str:
+
+# -------------------- ENV HELPERS --------------------
+def env_str(*names: str, default: str = "") -> str:
     for n in names:
-        v = os.getenv(n)
+        v = os.getenv(n, "")
         if v is not None and str(v).strip() != "":
             return str(v).strip()
     return default
 
-TELEGRAM_TOKEN = getenv_any("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", default="")
-WEBHOOK_BASE = getenv_any("WEBHOOK_BASE", "WEBHOOK_URL", "RENDER_EXTERNAL_URL", default="")
-REQUIRED_CHANNEL = getenv_any("REQUIRED_CHANNEL", "TG_CHANNEL", default="@gurenko_kristina_ai")
-CHANNEL_INVITE_URL = getenv_any("CHANNEL_INVITE_URL", default="https://t.me/gurenko_kristina_ai")
+def env_int(*names: str, default: int = 0) -> int:
+    v = env_str(*names, default="")
+    if not v:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
 
-INSTAGRAM_URL = getenv_any("INSTAGRAM_URL", default="https://www.instagram.com/gurenko_kristina/")
-AUTO_IG_VERIFY = getenv_any("AUTO_IG_VERIFY", default="0") == "1"
-STRICT_CHANNEL_CHECK = getenv_any("STRICT_CHANNEL_CHECK", default="1") == "1"
+def env_bool(*names: str, default: bool = False) -> bool:
+    v = env_str(*names, default="")
+    if v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-TZ_NAME = getenv_any("TZ", default="Asia/Tokyo")
-TZ = ZoneInfo(TZ_NAME)
 
-ADMIN_USER_ID = int(getenv_any("ADMIN_USER_ID", default="0") or 0)
-
-DAILY_LIMIT = int(getenv_any("DAILY_LIMIT", default="3") or 3)
-GEN_FREE_DAILY = int(getenv_any("GEN_FREE_DAILY", default="1") or 1)
-
-VIP_DAYS = int(getenv_any("VIP_DAYS", default="30") or 30)
-VIP_PRICE_STARS = int(getenv_any("VIP_PRICE_STARS", default="299") or 299)
-
-OPENAI_API_KEY = getenv_any("OPENAI_API_KEY", default="")
-OPENAI_MODEL = getenv_any("OPENAI_MODEL", default="gpt-4o-mini")
-OPENAI_IMAGE_MODEL = getenv_any("OPENAI_IMAGE_MODEL", "IMAGE_MODEL", default="gpt-image-1")
-
-DB_PATH = getenv_any("DB_PATH", default="bot.db")
-
+# -------------------- CONFIG --------------------
+# Telegram token (accept multiple keys to avoid Render confusion)
+TELEGRAM_TOKEN = env_str("TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_API_TOKEN", default="")
 if not TELEGRAM_TOKEN:
-    log.warning("TELEGRAM_BOT_TOKEN is empty. Bot will not work until set.")
-if not WEBHOOK_BASE:
-    log.warning("WEBHOOK_BASE is empty. Webhook setup will fail on startup.")
+    raise RuntimeError("TELEGRAM_TOKEN (or TELEGRAM_BOT_TOKEN) is not set")
+
+# Webhook base url (Render)
+WEBHOOK_BASE = env_str("WEBHOOK_BASE", "WEBHOOK_URL", "RENDER_EXTERNAL_URL", default="").rstrip("/")
+WEBHOOK_PATH = "/webhook"
+
+# Gates
+REQUIRED_CHANNEL = env_str("REQUIRED_CHANNEL", "TG_CHANNEL", default="@gurenko_kristina_ai")
+CHANNEL_INVITE_URL = env_str("CHANNEL_INVITE_URL", default="https://t.me/gurenko_kristina_ai")
+
+INSTAGRAM_URL = env_str("INSTAGRAM_URL", default="https://www.instagram.com/gurenko_kristina/")
+
+STRICT_CHANNEL_CHECK = env_bool("STRICT_CHANNEL_CHECK", default=True)
+AUTO_IG_VERIFY = env_bool("AUTO_IG_VERIFY", default=True)
+
+# Admin
+ADMIN_USER_ID = env_int("ADMIN_USER_ID", default=0)
+
+# Limits (free/vip)
+FREE_DAILY_LIMIT = env_int("FREE_DAILY_LIMIT", "GEN_FREE_DAILY", "DAILY_LIMIT", default=1)
+VIP_DAILY_LIMIT = env_int("VIP_DAILY_LIMIT", default=30)
+VIP_DAYS = env_int("VIP_DAYS", default=30)
+
+# VIP price in Telegram Stars
+VIP_PRICE_STARS = env_int("VIP_PRICE_STARS", default=299)  # 299 stars
+
+# Models
+OPENAI_API_KEY = env_str("OPENAI_API_KEY", default="")
+OPENAI_MODEL = env_str("OPENAI_MODEL", default="gpt-4o-mini")
+OPENAI_IMAGE_MODEL = env_str("OPENAI_IMAGE_MODEL", "IMAGE_MODEL", default="gpt-image-1")
+OPENAI_VIDEO_MODEL = env_str("OPENAI_VIDEO_MODEL", default="sora-2")
+
+# DB
+DB_PATH = env_str("DB_PATH", default="bot.db")
 
 
-# -----------------------------
-# DB (SQLite)
-# -----------------------------
-_db_lock = asyncio.Lock()
+# -------------------- FASTAPI --------------------
+app = FastAPI()
+tg_app: Application | None = None
+BOT_USERNAME: str | None = None
 
-def _db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+
+# -------------------- DB --------------------
+def db():
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-def _db_init():
-    conn = _db_connect()
-    cur = conn.cursor()
+def init_db():
+    with db() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            referred_by INTEGER,
+            ref_count INTEGER DEFAULT 0,
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        created_at TEXT,
-        referred_by INTEGER,
-        ref_rewarded INTEGER DEFAULT 0,
+            ig_verified INTEGER DEFAULT 0,
+            ig_pending INTEGER DEFAULT 0,
 
-        ig_handle TEXT,
-        ig_verified INTEGER DEFAULT 0,
-        ig_verified_at TEXT,
+            vip_until TEXT,
 
-        vip_until TEXT,
-        bonus_credits INTEGER DEFAULT 0
-    );
-    """)
+            used_day TEXT,
+            used_count INTEGER DEFAULT 0,
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS usage (
-        user_id INTEGER,
-        day TEXT,
-        used INTEGER DEFAULT 0,
-        PRIMARY KEY (user_id, day)
-    );
-    """)
+            bonus_credits INTEGER DEFAULT 0,
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS ig_requests (
-        user_id INTEGER PRIMARY KEY,
-        handle TEXT,
-        last_file_id TEXT,
-        status TEXT,
-        created_at TEXT
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-def now_iso() -> str:
-    return datetime.now(TZ).isoformat(timespec="seconds")
-
-def today_key() -> str:
-    return date.today().isoformat()
-
-async def db_exec(query: str, params: Tuple = ()) -> None:
-    async with _db_lock:
-        conn = _db_connect()
-        conn.execute(query, params)
+            created_at TEXT
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ig_requests (
+            user_id INTEGER PRIMARY KEY,
+            ig_handle TEXT,
+            note TEXT,
+            created_at TEXT
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            payload TEXT,
+            stars INTEGER,
+            status TEXT,
+            created_at TEXT
+        )
+        """)
         conn.commit()
-        conn.close()
 
-async def db_one(query: str, params: Tuple = ()) -> Optional[sqlite3.Row]:
-    async with _db_lock:
-        conn = _db_connect()
-        cur = conn.execute(query, params)
-        row = cur.fetchone()
-        conn.close()
-        return row
+def now_utc() -> datetime:
+    return datetime.utcnow()
 
-async def db_ensure_user(user_id: int) -> None:
-    row = await db_one("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    if row:
+def today_key_utc() -> str:
+    # daily reset in UTC (stable on servers)
+    return now_utc().date().isoformat()
+
+def ensure_user(u):
+    with db() as conn:
+        row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (u.id,)).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO users (user_id, username, first_name, created_at, used_day) VALUES (?, ?, ?, ?, ?)",
+                (u.id, u.username or "", u.first_name or "", now_utc().isoformat(), today_key_utc()),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET username=?, first_name=? WHERE user_id=?",
+                (u.username or "", u.first_name or "", u.id),
+            )
+        conn.commit()
+
+def get_user(user_id: int):
+    with db() as conn:
+        return conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+def set_referred(user_id: int, inviter_id: int):
+    if inviter_id == user_id:
         return
-    await db_exec(
-        "INSERT INTO users(user_id, created_at) VALUES(?, ?)",
-        (user_id, now_iso())
+    with db() as conn:
+        me = conn.execute("SELECT referred_by FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not me:
+            return
+        if me["referred_by"]:
+            return
+
+        conn.execute("UPDATE users SET referred_by=? WHERE user_id=?", (inviter_id, user_id))
+        conn.execute("UPDATE users SET ref_count = ref_count + 1 WHERE user_id=?", (inviter_id,))
+        # reward: +1 bonus credit per invite
+        conn.execute("UPDATE users SET bonus_credits = bonus_credits + 1 WHERE user_id=?", (inviter_id,))
+        conn.commit()
+
+def is_vip(row) -> bool:
+    if not row or not row["vip_until"]:
+        return False
+    try:
+        dt = datetime.fromisoformat(row["vip_until"])
+        return dt > now_utc()
+    except Exception:
+        return False
+
+def vip_until_text(row) -> str:
+    if not row or not row["vip_until"]:
+        return "нет"
+    return str(row["vip_until"]).replace("T", " ")
+
+def reset_daily_if_needed(row):
+    if not row:
+        return
+    td = today_key_utc()
+    if row["used_day"] != td:
+        with db() as conn:
+            conn.execute("UPDATE users SET used_day=?, used_count=0 WHERE user_id=?", (td, row["user_id"]))
+            conn.commit()
+
+def can_use_generation(row) -> tuple[bool, str]:
+    reset_daily_if_needed(row)
+    row = get_user(row["user_id"])
+    vip = is_vip(row)
+
+    bonus = int(row["bonus_credits"] or 0)
+    if bonus > 0:
+        return True, f"🎁 Бонус-генерации: {bonus} (они тратятся первыми)."
+
+    limit = VIP_DAILY_LIMIT if vip else FREE_DAILY_LIMIT
+    used = int(row["used_count"] or 0)
+    if used >= limit:
+        if vip:
+            return False, f"Лимит на сегодня: {used}/{limit} (VIP)."
+        return False, f"Лимит на сегодня: {used}/{limit}. Завтра снова будет доступно."
+    return True, f"Осталось сегодня: {limit - used}."
+
+def consume_generation(row):
+    reset_daily_if_needed(row)
+    row = get_user(row["user_id"])
+    bonus = int(row["bonus_credits"] or 0)
+    with db() as conn:
+        if bonus > 0:
+            conn.execute("UPDATE users SET bonus_credits = bonus_credits - 1 WHERE user_id=?", (row["user_id"],))
+        else:
+            conn.execute(
+                "UPDATE users SET used_count = used_count + 1, used_day=? WHERE user_id=?",
+                (today_key_utc(), row["user_id"])
+            )
+        conn.commit()
+
+
+# -------------------- UI --------------------
+def main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🖼 Фото"), KeyboardButton("🎬 Видео"), KeyboardButton("🤖 AI-помощник")],
+            [KeyboardButton("🎁 Промт дня"), KeyboardButton("📆 Челлендж 30"), KeyboardButton("🎁 Пригласить")],
+            [KeyboardButton("⭐ VIP (Stars)"), KeyboardButton("✅ IG"), KeyboardButton("ℹ️ Профиль")],
+        ],
+        resize_keyboard=True
     )
 
-async def db_set_referred_by(user_id: int, ref_id: int) -> None:
-    await db_ensure_user(user_id)
-    row = await db_one("SELECT referred_by FROM users WHERE user_id=?", (user_id,))
-    if row and row["referred_by"]:
-        return
-    if ref_id == user_id:
-        return
-    await db_exec("UPDATE users SET referred_by=? WHERE user_id=?", (ref_id, user_id))
+def fmt_header(title: str) -> str:
+    return f"✨ <b>{title}</b>\n"
 
-async def db_get_user(user_id: int) -> sqlite3.Row:
-    await db_ensure_user(user_id)
-    row = await db_one("SELECT * FROM users WHERE user_id=?", (user_id,))
-    return row
+def share_keyboard(user_id: int):
+    bot_un = BOT_USERNAME or "your_bot_username"
+    deep = f"https://t.me/{bot_un}?start=ref_{user_id}"
+    share_url = (
+        "https://t.me/share/url?"
+        f"url={quote(deep)}&text={quote('Забирай бот с промтами + генерацией фото/видео 👇')}"
+    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Поделиться (готовый шаблон)", url=share_url)],
+        [InlineKeyboardButton("🔗 Открыть мою ссылку", url=deep)],
+    ])
 
-def _parse_dt(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
+def channel_gate_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подписаться на канал", url=CHANNEL_INVITE_URL)],
+        [InlineKeyboardButton("🔁 Я подписался — проверить", callback_data="check_channel")]
+    ])
+
+def instagram_gate_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📷 Открыть Instagram", url=INSTAGRAM_URL)],
+        [InlineKeyboardButton("✅ Я подписался — отправить @ник + скрин", callback_data="ig_request")]
+    ])
+
+def vip_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⭐ Купить VIP за {VIP_PRICE_STARS} Stars", callback_data="vip_pay")],
+    ])
+
+async def safe_edit(query, text: str, reply_markup=None):
     try:
-        return datetime.fromisoformat(s).astimezone(TZ)
-    except Exception:
-        return None
-
-async def db_is_vip(user_id: int) -> bool:
-    u = await db_get_user(user_id)
-    dt = _parse_dt(u["vip_until"])
-    return bool(dt and dt > datetime.now(TZ))
-
-async def db_add_vip_days(user_id: int, days: int) -> None:
-    u = await db_get_user(user_id)
-    current = _parse_dt(u["vip_until"])
-    base = current if current and current > datetime.now(TZ) else datetime.now(TZ)
-    new_dt = base + timedelta(days=days)
-    await db_exec("UPDATE users SET vip_until=? WHERE user_id=?", (new_dt.isoformat(timespec="seconds"), user_id))
-
-async def db_get_usage(user_id: int) -> int:
-    row = await db_one("SELECT used FROM usage WHERE user_id=? AND day=?", (user_id, today_key()))
-    return int(row["used"]) if row else 0
-
-async def db_inc_usage(user_id: int) -> None:
-    used = await db_get_usage(user_id)
-    if used == 0:
-        await db_exec("INSERT OR REPLACE INTO usage(user_id, day, used) VALUES(?, ?, ?)", (user_id, today_key(), 1))
-    else:
-        await db_exec("UPDATE usage SET used=used+1 WHERE user_id=? AND day=?", (user_id, today_key()))
-
-async def db_add_bonus_credits(user_id: int, n: int) -> None:
-    await db_exec("UPDATE users SET bonus_credits=bonus_credits+? WHERE user_id=?", (n, user_id))
-
-async def db_use_bonus_credit_if_any(user_id: int) -> bool:
-    u = await db_get_user(user_id)
-    if int(u["bonus_credits"]) > 0:
-        await db_exec("UPDATE users SET bonus_credits=bonus_credits-1 WHERE user_id=?", (user_id,))
-        return True
-    return False
-
-async def db_set_ig_info(user_id: int, handle: Optional[str], file_id: Optional[str], verified: bool) -> None:
-    await db_ensure_user(user_id)
-    if handle:
-        await db_exec("UPDATE users SET ig_handle=? WHERE user_id=?", (handle, user_id))
-        await db_exec("""
-            INSERT INTO ig_requests(user_id, handle, last_file_id, status, created_at)
-            VALUES(?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET handle=excluded.handle, last_file_id=excluded.last_file_id, status=excluded.status
-        """, (user_id, handle, file_id or "", "received", now_iso()))
-    else:
-        # update only file_id
-        await db_exec("""
-            INSERT INTO ig_requests(user_id, handle, last_file_id, status, created_at)
-            VALUES(?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET last_file_id=excluded.last_file_id, status=excluded.status
-        """, (user_id, "", file_id or "", "received", now_iso()))
-
-    if verified:
-        await db_exec("UPDATE users SET ig_verified=1, ig_verified_at=? WHERE user_id=?", (now_iso(), user_id))
-        await db_exec("UPDATE ig_requests SET status='approved' WHERE user_id=?", (user_id,))
-
-async def db_set_ig_verified(user_id: int, verified: bool) -> None:
-    if verified:
-        await db_exec("UPDATE users SET ig_verified=1, ig_verified_at=? WHERE user_id=?", (now_iso(), user_id))
-        await db_exec("UPDATE ig_requests SET status='approved' WHERE user_id=?", (user_id,))
-    else:
-        await db_exec("UPDATE users SET ig_verified=0 WHERE user_id=?", (user_id,))
-        await db_exec("UPDATE ig_requests SET status='rejected' WHERE user_id=?", (user_id,))
-
-
-async def maybe_reward_referral(user_id: int) -> None:
-    """
-    Reward referrer once, when user is fully unlocked (channel+IG).
-    """
-    u = await db_get_user(user_id)
-    if int(u["ref_rewarded"]) == 1:
-        return
-    ref_id = u["referred_by"]
-    if not ref_id:
-        return
-
-    # reward: +3 bonus generations
-    await db_add_bonus_credits(int(ref_id), 3)
-    await db_exec("UPDATE users SET ref_rewarded=1 WHERE user_id=?", (user_id,))
-
-
-# -----------------------------
-# Telegram UI
-# -----------------------------
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 ИИ помощник", callback_data="ai_mode")],
-        [InlineKeyboardButton("🖼 Сгенерировать фото", callback_data="gen_image")],
-        [InlineKeyboardButton("⭐️ VIP / Подписка", callback_data="vip")],
-        [InlineKeyboardButton("🎁 Пригласить друга (+бонус)", callback_data="ref")],
-        [InlineKeyboardButton("📌 Инструкция / Канал", url=CHANNEL_INVITE_URL)],
-    ])
-
-def gate_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Я подписалась на канал", callback_data="check_channel")],
-        [InlineKeyboardButton("🔗 Открыть канал", url=CHANNEL_INVITE_URL)],
-        [InlineKeyboardButton("✅ Подтвердить Instagram", callback_data="ig_start")],
-        [InlineKeyboardButton("🔗 Открыть Instagram", url=INSTAGRAM_URL)],
-    ])
-
-def vip_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"⭐ Купить VIP на {VIP_DAYS} дней — {VIP_PRICE_STARS} Stars", callback_data="buy_vip")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
-    ])
-
-def ig_admin_kb(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Одобрить", callback_data=f"ig_approve:{user_id}"),
-            InlineKeyboardButton("❌ Отклонить", callback_data=f"ig_reject:{user_id}"),
-        ]
-    ])
-
-async def safe_edit(query, text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
-    try:
-        await query.edit_message_text(text=text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await query.edit_message_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
     except BadRequest as e:
-        msg = str(e).lower()
-        if "message is not modified" in msg:
-            # ignore
-            return
-        raise
+        # If "message is not modified" or other edit problems — just send a new message
+        if "Message is not modified" in str(e):
+            await query.message.reply_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        else:
+            await query.message.reply_text(
+                "⚠️ Не смог обновить сообщение, но я рядом. Попробуй ещё раз.",
+                reply_markup=main_menu()
+            )
 
-# -----------------------------
-# Channel check (FIXED)
-# -----------------------------
-async def is_subscribed_to_channel(bot, user_id: int) -> Tuple[bool, str]:
-    """
-    Returns (ok, reason). Robust across PTB versions.
-    """
+
+# -------------------- GATES --------------------
+async def is_subscribed_to_channel(bot, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
-        status = str(member.status).lower()  # 'member', 'administrator', 'creator'/'owner', 'restricted', 'left', 'kicked'
-        if status in ("left", "kicked"):
-            return False, f"status={status}"
-        return True, f"status={status}"
+        # ptb 21.8 status is a string like "member"/"administrator"/"creator"/"restricted"/"left"/"kicked"
+        status = getattr(member, "status", None)
+        if status in ("member", "administrator", "creator", "restricted"):
+            return True
+        return False
     except Exception as e:
         log.warning("channel check failed: %s", e)
-        if STRICT_CHANNEL_CHECK:
-            return False, f"error={type(e).__name__}"
-        # if not strict -> allow
-        return True, "check_error_but_allowed"
+        return False if STRICT_CHANNEL_CHECK else True
+
+def ig_status_text(row) -> str:
+    if int(row["ig_verified"] or 0) == 1:
+        return "подтверждён ✅"
+    if int(row["ig_pending"] or 0) == 1:
+        return "на проверке ⏳"
+    return "не подтверждён ❌"
 
 async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    if not user:
+    u = update.effective_user
+    ensure_user(u)
+
+    ok = await is_subscribed_to_channel(context.bot, u.id)
+    if not ok:
+        text = (
+            fmt_header("Доступ закрыт")
+            + "🔒 Чтобы пользоваться ботом, нужно быть подписанным на мой Telegram-канал.\n\n"
+            "1) Нажми «Подписаться на канал»\n"
+            "2) Затем «Я подписался — проверить»"
+        )
+        await update.effective_message.reply_text(
+            text, reply_markup=channel_gate_keyboard(), parse_mode=ParseMode.HTML
+        )
         return False
-    user_id = user.id
-    await db_ensure_user(user_id)
 
-    ok, _reason = await is_subscribed_to_channel(context.bot, user_id)
-    u = await db_get_user(user_id)
-    ig_ok = int(u["ig_verified"]) == 1
+    row = get_user(u.id)
+    if int(row["ig_verified"] or 0) != 1:
+        text = (
+            fmt_header("Ещё 1 шаг — Instagram")
+            + "🔒 Подтверждение подписки на Instagram.\n\n"
+            "Instagram не даёт надёжной авто-проверки подписки через бота.\n"
+            "Поэтому ты отправляешь @ник + скрин.\n\n"
+            "Нажми кнопку ниже 👇"
+        )
+        await update.effective_message.reply_text(
+            text, reply_markup=instagram_gate_keyboard(), parse_mode=ParseMode.HTML
+        )
+        return False
 
-    if ok and ig_ok:
-        # reward referral when first fully unlocked
-        await maybe_reward_referral(user_id)
-        return True
+    return True
 
-    txt = (
-        "🔒 <b>Доступ закрыт</b>\n\n"
-        "Чтобы открыть меню:\n"
-        "1) Подпишись на Telegram-канал\n"
-        f"2) Подтверди Instagram (ник + скрин)\n\n"
-        f"Канал: {REQUIRED_CHANNEL}\n"
-        f"Instagram: {INSTAGRAM_URL}\n"
-    )
-    if update.callback_query:
-        await update.callback_query.answer()
-        await safe_edit(update.callback_query, txt, gate_kb())
-    else:
-        await update.effective_message.reply_text(txt, reply_markup=gate_kb(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    return False
 
-# -----------------------------
-# OpenAI helpers
-# -----------------------------
-def openai_client() -> Optional[OpenAI]:
-    if not OPENAI_API_KEY:
+# -------------------- OPENAI --------------------
+def get_openai_client():
+    if not (OPENAI_AVAILABLE and OPENAI_API_KEY):
         return None
     return OpenAI(api_key=OPENAI_API_KEY)
 
-async def openai_text(prompt: str) -> str:
-    client = openai_client()
+def openai_generate_image(prompt: str) -> tuple[bytes | None, str | None]:
+    client = get_openai_client()
     if not client:
-        return "OpenAI ключ не настроен. Добавь OPENAI_API_KEY в Render."
-    def _run():
-        r = client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": "Ты полезный ИИ-помощник Кристины. Отвечай по делу, давай пошаговые инструкции, промты и идеи для контента."},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        # responses api returns output_text convenience
-        return getattr(r, "output_text", None) or (r.output[0].content[0].text if r.output else "…")
-    return await asyncio.to_thread(_run)
+        return None, "OpenAI не настроен: нет OPENAI_API_KEY."
 
-async def openai_image(prompt: str) -> Tuple[bool, str]:
-    client = openai_client()
-    if not client:
-        return False, "OpenAI ключ не настроен (OPENAI_API_KEY пустой)."
-    def _run():
-        img = client.images.generate(
+    try:
+        res = client.images.generate(
             model=OPENAI_IMAGE_MODEL,
             prompt=prompt,
-            size="1024x1024",
+            size="1024x1024"
         )
-        # return b64_json or url depending; here assume base64
-        b64 = img.data[0].b64_json
-        return b64
-    try:
-        b64 = await asyncio.to_thread(_run)
-        return True, b64
+        data0 = res.data[0]
+        b64 = getattr(data0, "b64_json", None) or (data0.get("b64_json") if isinstance(data0, dict) else None)
+        if not b64:
+            return None, "Не пришли данные изображения (b64_json пуст)."
+        return base64.b64decode(b64), None
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return None, (
+            "❌ Не удалось сгенерировать фото.\n\n"
+            f"Ошибка: {e}\n\n"
+            "Проверь:\n"
+            "• ключ должен начинаться с sk- (не proj_)\n"
+            "• в проекте включены Images/доступ к модели\n"
+            "• включён billing/лимиты\n"
+        )
 
-# -----------------------------
-# Handlers
-# -----------------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    await db_ensure_user(user.id)
+def openai_assistant_reply(user_text: str) -> tuple[str | None, str | None]:
+    client = get_openai_client()
+    if not client:
+        return None, "OpenAI не настроен: нет OPENAI_API_KEY."
+    try:
+        r = client.responses.create(
+            model=OPENAI_MODEL,
+            input=user_text,
+        )
+        # Try to extract text
+        out = ""
+        if hasattr(r, "output_text") and r.output_text:
+            out = r.output_text
+        else:
+            # fallback: try common structure
+            out = str(r)
+        return out.strip()[:3500], None
+    except Exception as e:
+        return None, f"AI-помощник сейчас недоступен: {e}"
 
-    # referral param
-    if context.args:
-        m = re.match(r"^ref_(\d+)$", context.args[0])
-        if m:
-            await db_set_referred_by(user.id, int(m.group(1)))
+def openai_generate_video_stub(prompt: str) -> tuple[None, str]:
+    return None, (
+        "🎬 Видео (Sora) в этом деплое включим следующим шагом.\n\n"
+        "Почему: у видео отдельный API/доступ и часто нужен отдельный enable в проекте.\n"
+        "Я оставила кнопку и UX, чтобы всё было готово.\n\n"
+        "Пока могу:\n"
+        "• сделать супер-промт под Sora/Meta AI\n"
+        "• собрать сценарий из кадров\n"
+    )
 
-    # Show gate or menu
-    if not await require_access(update, context):
-        return
 
+# -------------------- COMMANDS --------------------
+async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
     await update.effective_message.reply_text(
-        "✨ <b>Привет!</b>\n\nМеню открыто. Выбирай действие 👇",
-        reply_markup=main_menu_kb(),
+        f"🆔 Твой Telegram numeric id: <code>{u.id}</code>",
         parse_mode=ParseMode.HTML
     )
 
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_USERNAME
+    u = update.effective_user
+    ensure_user(u)
+
+    # referral
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("ref_"):
+            try:
+                inviter = int(arg.replace("ref_", "").strip())
+                set_referred(u.id, inviter)
+            except Exception:
+                pass
+
+    if BOT_USERNAME is None:
+        me = await context.bot.get_me()
+        BOT_USERNAME = me.username
+
+    # First: channel gate прямо на старте (как ты просила)
+    ok = await is_subscribed_to_channel(context.bot, u.id)
+    if not ok:
+        text = (
+            fmt_header("Привет! Я бот Кристины 🤍")
+            + "Сначала — быстрая проверка подписки на канал.\n\n"
+            "Нажми кнопку ниже 👇"
+        )
+        await update.effective_message.reply_text(
+            text, reply_markup=channel_gate_keyboard(), parse_mode=ParseMode.HTML
+        )
+        return
+
+    row = get_user(u.id)
+    if int(row["ig_verified"] or 0) != 1:
+        text = (
+            fmt_header("Почти готово 🤍")
+            + "Теперь подтвердим Instagram.\n\n"
+            "Нажми кнопку ниже и отправь @ник + скрин 👇"
+        )
+        await update.effective_message.reply_text(
+            text, reply_markup=instagram_gate_keyboard(), parse_mode=ParseMode.HTML
+        )
+        return
+
+    # Full welcome
+    row = get_user(u.id)
+    ok2, left_msg = can_use_generation(row)
+    text = (
+        fmt_header("Добро пожаловать 🤍")
+        + "Я умею:\n"
+        "• 🖼 Генерировать фото\n"
+        "• 🤖 AI-помощник (вопросы/идеи/промты)\n"
+        "• 🎁 Промт дня + 📆 30-дневный челлендж\n"
+        "• 🎁 Рефералка: приглашай друзей → получай бонус-генерации\n"
+        "• ⭐ VIP за Telegram Stars\n\n"
+        f"Статус: VIP {'✅' if is_vip(row) else '❌'} | IG: {ig_status_text(row)}\n"
+        f"{left_msg}\n\n"
+        "Выбирай кнопку 👇"
+    )
+    await update.effective_message.reply_text(
+        text,
+        reply_markup=main_menu(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
+async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context):
         return
-    await update.effective_message.reply_text("Меню 👇", reply_markup=main_menu_kb())
+    row = get_user(update.effective_user.id)
+    ok, msg = can_use_generation(row)
+    text = (
+        fmt_header("Профиль")
+        + f"• VIP: {'активен ✅' if is_vip(row) else 'нет ❌'}\n"
+        + f"• VIP до: <b>{vip_until_text(row)}</b>\n"
+        + f"• Instagram: <b>{ig_status_text(row)}</b>\n"
+        + f"• Приглашено друзей: <b>{int(row['ref_count'] or 0)}</b>\n"
+        + f"• Бонус-генерации: <b>{int(row['bonus_credits'] or 0)}</b>\n"
+        + f"• Дневной лимит: free <b>{FREE_DAILY_LIMIT}</b> / VIP <b>{VIP_DAILY_LIMIT}</b>\n\n"
+        + f"{msg}"
+    )
+    await update.effective_message.reply_text(text, reply_markup=main_menu(), parse_mode=ParseMode.HTML)
 
-async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
+async def vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
         return
-    await update.effective_message.reply_text(f"Твой numeric id: <code>{user.id}</code>", parse_mode=ParseMode.HTML)
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("mode", None)
-    await update.effective_message.reply_text("Ок, вышли из режима. Меню 👇", reply_markup=main_menu_kb())
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    user_id = query.from_user.id
-    await db_ensure_user(user_id)
-
-    data = query.data or ""
-
-    # IG admin actions
-    if data.startswith("ig_approve:") or data.startswith("ig_reject:"):
-        if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
-            await query.answer("Нет доступа.", show_alert=True)
-            return
-        target = int(data.split(":")[1])
-        if data.startswith("ig_approve:"):
-            await db_set_ig_verified(target, True)
-            await context.bot.send_message(chat_id=target, text="✅ Instagram подтверждён! Меню открыто 👇", reply_markup=main_menu_kb())
-            await safe_edit(query, "✅ Одобрено.")
-        else:
-            await db_set_ig_verified(target, False)
-            await context.bot.send_message(chat_id=target, text="❌ Instagram не подтверждён. Пришли ник и скрин ещё раз через меню.")
-            await safe_edit(query, "❌ Отклонено.")
-        return
-
-    if data in ("menu",):
-        if not await require_access(update, context):
-            return
-        await safe_edit(query, "Меню 👇", main_menu_kb())
-        return
-
-    if data == "check_channel":
-        # just re-check and show correct screen
-        if not await require_access(update, context):
-            return
-        await safe_edit(query, "✅ Канал ок. Меню 👇", main_menu_kb())
-        return
-
-    if data == "ig_start":
-        # ask for IG
-        await safe_edit(
-            query,
-            "Отправь <b>ник Instagram</b> (например: <code>gurenko_kristina</code>) и/или <b>скрин подписки</b>.\n\n"
-            "После этого я открою меню (если включён AUTO_IG_VERIFY) или отправлю админу на подтверждение.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="menu")]])
+    row = get_user(update.effective_user.id)
+    if is_vip(row):
+        text = (
+            fmt_header("VIP активен ✅")
+            + f"VIP до: <b>{vip_until_text(row)}</b>\n"
+            + f"Лимит: <b>{VIP_DAILY_LIMIT}/день</b>\n\n"
+            "Спасибо 🤍"
         )
-        context.user_data["await_ig"] = True
+        await update.effective_message.reply_text(text, reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 
-    if data == "ai_mode":
-        if not await require_access(update, context):
-            return
-        context.user_data["mode"] = "ai"
-        await safe_edit(
-            query,
-            "🤖 <b>ИИ помощник включён</b>\n\nПиши вопрос сообщением — отвечу.\n\n"
-            "Команды: /reset — выйти в меню.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="menu")]])
-        )
+    text = (
+        fmt_header("VIP / Подписка ⭐")
+        + "VIP даёт:\n"
+        f"• до <b>{VIP_DAILY_LIMIT}</b> генераций/день\n"
+        f"• срок <b>{VIP_DAYS} дней</b>\n\n"
+        f"Цена: <b>{VIP_PRICE_STARS} Stars</b>\n\n"
+        "Нажми кнопку оплаты 👇"
+    )
+    await update.effective_message.reply_text(
+        text,
+        reply_markup=vip_keyboard(),
+        parse_mode=ParseMode.HTML
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
         return
+    text = (
+        fmt_header("Как пользоваться")
+        + "1) 🖼 Фото → напиши описание → получишь картинку.\n"
+        "2) 🤖 AI-помощник → задай вопрос/попроси промт/сценарий.\n"
+        "3) 🎁 Пригласить → делись ссылкой → получаешь бонус-генерации.\n"
+        "4) ⭐ VIP → оплатить Stars → всё открывается автоматически.\n\n"
+        "Команды:\n"
+        "• /start — старт\n"
+        "• /myid — твой numeric id\n"
+    )
+    await update.effective_message.reply_text(text, reply_markup=main_menu(), parse_mode=ParseMode.HTML)
 
-    if data == "gen_image":
-        if not await require_access(update, context):
-            return
-        context.user_data["mode"] = "image"
-        await safe_edit(
-            query,
-            "🖼 Напиши, какое фото сделать (1 сообщением).\n\n"
-            "Пример: <i>«Ультра-реалистичный зимний fashion-портрет, 8K, мягкий свет, снежинки на волосах…»</i>\n\n"
-            "Команды: /reset — выйти в меню.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="menu")]])
-        )
+
+# -------------------- ADMIN --------------------
+async def ig_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_USER_ID and update.effective_user.id != ADMIN_USER_ID:
         return
-
-    if data == "vip":
-        if not await require_access(update, context):
-            return
-        await safe_edit(query, "⭐️ <b>VIP</b>\n\nVIP снимает лимиты и даёт приоритет.", vip_kb())
+    if not context.args:
+        await update.message.reply_text("Формат: /ig_ok <user_id>")
         return
+    uid = int(context.args[0])
+    with db() as conn:
+        conn.execute("UPDATE users SET ig_verified=1, ig_pending=0 WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM ig_requests WHERE user_id=?", (uid,))
+        conn.commit()
+    await update.message.reply_text(f"✅ IG подтвержден для {uid}")
+    try:
+        await context.bot.send_message(uid, "✅ Instagram подтвержден! Доступ открыт 🎉", reply_markup=main_menu())
+    except Exception:
+        pass
 
-    if data == "buy_vip":
-        if not await require_access(update, context):
-            return
-
-        # Telegram Stars invoice: currency XTR, provider_token can be empty string for Stars
-        prices = [LabeledPrice(label=f"VIP на {VIP_DAYS} дней", amount=VIP_PRICE_STARS)]
-        payload = f"vip:{user_id}:{int(time.time())}"
-
-        try:
-            await context.bot.send_invoice(
-                chat_id=user_id,
-                title=f"VIP на {VIP_DAYS} дней",
-                description="Открывает VIP-доступ в боте.",
-                payload=payload,
-                provider_token="",      # Stars
-                currency="XTR",
-                prices=prices,
-            )
-        except Exception as e:
-            await query.answer("Не удалось выставить счёт. Проверь оплату Stars в боте.", show_alert=True)
-            log.exception("send_invoice failed: %s", e)
+async def ig_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_USER_ID and update.effective_user.id != ADMIN_USER_ID:
         return
-
-    if data == "ref":
-        if not await require_access(update, context):
-            return
-        bot_username = (await context.bot.get_me()).username
-        link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-        await safe_edit(
-            query,
-            "🎁 <b>Бонус за друга</b>\n\n"
-            "Отправь другу эту ссылку. Когда он подпишется на канал и подтвердит Instagram — тебе начислится <b>+3</b> генерации.\n\n"
-            f"<code>{link}</code>",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="menu")]])
-        )
+    if not context.args:
+        await update.message.reply_text("Формат: /ig_no <user_id>")
         return
+    uid = int(context.args[0])
+    with db() as conn:
+        conn.execute("UPDATE users SET ig_pending=0 WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM ig_requests WHERE user_id=?", (uid,))
+        conn.commit()
+    await update.message.reply_text(f"❌ IG отклонен для {uid}")
+    try:
+        await context.bot.send_message(uid, "❌ Не получилось подтвердить Instagram. Пришли заявку ещё раз.")
+    except Exception:
+        pass
+
+async def vip_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_USER_ID and update.effective_user.id != ADMIN_USER_ID:
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Формат: /vip_add <user_id> [days]")
+        return
+    uid = int(context.args[0])
+    days = int(context.args[1]) if len(context.args) > 1 else VIP_DAYS
+    until = now_utc() + timedelta(days=days)
+    with db() as conn:
+        conn.execute("UPDATE users SET vip_until=? WHERE user_id=?", (until.isoformat(), uid))
+        conn.commit()
+    await update.message.reply_text(f"⭐️ VIP выдан для {uid} до {until.isoformat()}")
+    try:
+        await context.bot.send_message(uid, f"⭐️ VIP активирован до {until.isoformat()} 🎉", reply_markup=main_menu())
+    except Exception:
+        pass
 
 
+# -------------------- MODES --------------------
+async def set_mode_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
+        return
+    context.user_data["mode"] = "image"
+    await update.effective_message.reply_text(
+        fmt_header("Фото-генерация")
+        + "Напиши описание (чем подробнее — тем лучше).\n\n"
+        "<i>Пример:</i> ультра-реалистичный зимний fashion-портрет, мягкий свет, 8K, натуральная кожа…",
+        parse_mode=ParseMode.HTML
+    )
+
+async def set_mode_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
+        return
+    context.user_data["mode"] = "video"
+    await update.effective_message.reply_text(
+        fmt_header("Видео-генерация")
+        + "Напиши идею/сцену — я:\n"
+        "• либо сгенерирую (если видео-API включено)\n"
+        "• либо соберу идеальный промт + сценарий\n",
+        parse_mode=ParseMode.HTML
+    )
+
+async def set_mode_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
+        return
+    context.user_data["mode"] = "ai"
+    await update.effective_message.reply_text(
+        fmt_header("AI-помощник 🤖")
+        + "Пиши запрос: идеи Reels, промты Sora/HeyGen/Meta, сценарий, текст поста, оффер, хештеги.\n\n"
+        "Я отвечу как твой личный продюсер/маркетолог/промт-инженер 💅",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# -------------------- TEXT/PHOTO HANDLERS --------------------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
+    txt = (update.effective_message.text or "").strip()
+    u = update.effective_user
+    ensure_user(u)
+
+    # Menu buttons
+    if txt == "🖼 Фото":
+        return await set_mode_image(update, context)
+    if txt == "🎬 Видео":
+        return await set_mode_video(update, context)
+    if txt == "🤖 AI-помощник":
+        return await set_mode_ai(update, context)
+    if txt == "ℹ️ Профиль":
+        return await profile_cmd(update, context)
+    if txt == "⭐ VIP (Stars)":
+        return await vip_menu(update, context)
+    if txt == "ℹ️ Помощь":
+        return await help_cmd(update, context)
+    if txt == "🎁 Пригласить":
+        if not await require_access(update, context):
+            return
+        await update.effective_message.reply_text(
+            fmt_header("Приглашай друзей — получай бонусы 🎁")
+            + "За каждого друга по твоей ссылке ты получаешь +1 бонус-генерацию.\n\n"
+            "Жми кнопку «Поделиться» — текст уже готов ✅",
+            reply_markup=share_keyboard(u.id),
+            parse_mode=ParseMode.HTML
+        )
         return
-    await db_ensure_user(user.id)
+    if txt == "✅ IG":
+        await update.effective_message.reply_text(
+            fmt_header("Instagram подтверждение")
+            + "Нажми кнопку ниже и отправь @ник + скрин.\n",
+            reply_markup=instagram_gate_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+        return
 
-    # If waiting IG info
-    if context.user_data.get("await_ig"):
-        txt = (update.effective_message.text or "").strip()
-        handle = None
-        if txt:
-            handle = txt.lstrip("@").strip()
-        verified = AUTO_IG_VERIFY
+    if txt == "🎁 Промт дня":
+        if not await require_access(update, context):
+            return
+        prompts = [
+            "Ультра-реалистичный fashion-портрет, морозные ресницы, 85mm, мягкий свет, 8K, детальная кожа.",
+            "Кинематографичный зимний кадр, лёгкий снег, объёмный свет, реалистичная ткань, 4K.",
+            "Editorial-фото, минимализм, чистый фон, натуральная кожа, high-end retouch.",
+            "Reels-стиль: динамичный ракурс, лёгкий motion blur, реализм, естественные цвета, 4K.",
+        ]
+        idx = int(time.time() // 86400) % len(prompts)
+        await update.effective_message.reply_text(
+            fmt_header("Промт дня 🎁") + prompts[idx],
+            reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML
+        )
+        return
 
-        await db_set_ig_info(user.id, handle, None, verified=verified)
+    if txt == "📆 Челлендж 30":
+        if not await require_access(update, context):
+            return
+        tasks = [
+            "День 1: 3 варианта одного портрета (разный свет).",
+            "День 2: Один кадр в 3 ракурсах (close/mid/full).",
+            "День 3: Кожа: поры/текстура/без пластика.",
+            "День 4: Снег/частицы: реалистичный snowfall и bokeh.",
+            "День 5: Outfit-замена без изменения лица.",
+        ]
+        day_idx = int(time.time() // 86400) % len(tasks)
+        await update.effective_message.reply_text(
+            fmt_header("Челлендж 📆") + tasks[day_idx] + "\n\nХочешь — добавлю все 30 дней + прогресс ✅",
+            reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML
+        )
+        return
 
-        # notify admin if not auto
-        if not AUTO_IG_VERIFY and ADMIN_USER_ID:
-            await context.bot.send_message(
-                chat_id=ADMIN_USER_ID,
-                text=f"🧾 <b>IG запрос</b>\nuser_id: <code>{user.id}</code>\nhandle: <code>{handle or ''}</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ig_admin_kb(user.id),
+    # If user is currently providing IG info after pressing button
+    if context.user_data.get("await_ig_info"):
+        handle = txt.strip()
+        if handle.startswith("@"):
+            handle = handle[1:]
+        with db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO ig_requests (user_id, ig_handle, note, created_at) VALUES (?, ?, ?, ?)",
+                (u.id, handle, "handle received", now_utc().isoformat())
             )
+            conn.execute("UPDATE users SET ig_pending=1 WHERE user_id=?", (u.id,))
+            conn.commit()
 
-        context.user_data["await_ig"] = False
-
-        # show menu or gate
-        if await require_access(update, context):
-            await update.effective_message.reply_text("✅ Принято. Меню 👇", reply_markup=main_menu_kb())
-        else:
-            await update.effective_message.reply_text("✅ Принято. Теперь подпишись на канал и/или дождись подтверждения.", reply_markup=gate_kb())
-        return
-
-    # Mode handlers
-    mode = context.user_data.get("mode")
-
-    if mode == "ai":
-        if not await require_access(update, context):
-            return
-        q = update.effective_message.text or ""
-        msg = await update.effective_message.reply_text("Думаю…")
-        ans = await openai_text(q)
-        try:
-            await msg.edit_text(ans)
-        except Exception:
-            await update.effective_message.reply_text(ans)
-        return
-
-    if mode == "image":
-        if not await require_access(update, context):
-            return
-
-        is_vip = await db_is_vip(user.id)
-        used = await db_get_usage(user.id)
-
-        # allow bonus credits first
-        if not is_vip:
-            used_bonus = await db_use_bonus_credit_if_any(user.id)
-            if not used_bonus:
-                if used >= DAILY_LIMIT:
-                    await update.effective_message.reply_text(
-                        f"Лимит на сегодня исчерпан: {DAILY_LIMIT}/{DAILY_LIMIT}.\n"
-                        "Можно купить VIP ⭐️ или пригласить друга 🎁",
-                        reply_markup=main_menu_kb()
-                    )
-                    return
-                await db_inc_usage(user.id)
-
-        prompt = update.effective_message.text or ""
-        wait = await update.effective_message.reply_text("🖼 Генерирую…")
-
-        ok, result = await openai_image(prompt)
-        if not ok:
-            await wait.edit_text(
-                "Не удалось сгенерировать фото.\n\n"
-                f"Ошибка: <code>{result}</code>\n\n"
-                "Проверь:\n"
-                "1) OPENAI_API_KEY (активен)\n"
-                "2) есть доступ к images/model\n"
-                f"3) OPENAI_IMAGE_MODEL={OPENAI_IMAGE_MODEL}",
+        if AUTO_IG_VERIFY:
+            with db() as conn:
+                conn.execute("UPDATE users SET ig_verified=1, ig_pending=0 WHERE user_id=?", (u.id,))
+                conn.execute("DELETE FROM ig_requests WHERE user_id=?", (u.id,))
+                conn.commit()
+            context.user_data["await_ig_info"] = False
+            await update.effective_message.reply_text(
+                fmt_header("Готово ✅")
+                + "Instagram подтвержден (auto). Доступ открыт 🎉\n\nВыбирай кнопку 👇",
+                reply_markup=main_menu(),
                 parse_mode=ParseMode.HTML
             )
             return
 
-        # send base64 as photo
-        import base64
-        data = base64.b64decode(result)
-        await context.bot.send_photo(chat_id=user.id, photo=data, caption="Готово ✅")
-        try:
-            await wait.delete()
-        except Exception:
-            pass
+        context.user_data["await_ig_info"] = False
+        await update.effective_message.reply_text(
+            fmt_header("Заявка принята ✅")
+            + "Я проверю и открою доступ.\n\n"
+            "Если нужно быстрее — напиши мне: «проверь IG в боте».",
+            reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML
+        )
+        if ADMIN_USER_ID:
+            try:
+                await context.bot.send_message(
+                    ADMIN_USER_ID,
+                    f"IG-заявка: user_id={u.id}, username=@{u.username}, ig=@{handle}\n"
+                    f"Подтверди: /ig_ok {u.id}  |  Отклонить: /ig_no {u.id}"
+                )
+            except Exception:
+                pass
         return
 
-    # default
+    # Normal flow needs access
     if not await require_access(update, context):
         return
-    await update.effective_message.reply_text("Выбери действие 👇", reply_markup=main_menu_kb())
 
+    mode = context.user_data.get("mode")
+
+    if mode in ("image", "video", "ai") and txt:
+        row = get_user(u.id)
+
+        # AI helper does NOT consume generations
+        if mode == "ai":
+            await update.effective_message.reply_text("🤖 Думаю…")
+            ans, err = openai_assistant_reply(txt)
+            if err:
+                await update.effective_message.reply_text(err, reply_markup=main_menu())
+            else:
+                await update.effective_message.reply_text(ans, reply_markup=main_menu())
+            return
+
+        ok, msg = can_use_generation(row)
+        if not ok:
+            await update.effective_message.reply_text("⛔️ " + msg, reply_markup=main_menu())
+            context.user_data["mode"] = None
+            return
+
+        await update.effective_message.reply_text("⏳ Генерирую…")
+
+        if mode == "image":
+            img, err = openai_generate_image(txt)
+            if err:
+                await update.effective_message.reply_text(err, reply_markup=main_menu())
+            else:
+                consume_generation(row)
+                await update.effective_message.reply_photo(photo=img, caption="Готово ✅", reply_markup=main_menu())
+        else:
+            _, err = openai_generate_video_stub(txt)
+            await update.effective_message.reply_text(err, reply_markup=main_menu())
+
+        context.user_data["mode"] = None
+        return
+
+    await update.effective_message.reply_text(
+        "Выбирай кнопку в меню 👇",
+        reply_markup=main_menu()
+    )
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    await db_ensure_user(user.id)
+    u = update.effective_user
+    ensure_user(u)
 
-    # IG screenshot support
-    if context.user_data.get("await_ig"):
-        photos = update.effective_message.photo or []
-        file_id = photos[-1].file_id if photos else None
-        verified = AUTO_IG_VERIFY
-        await db_set_ig_info(user.id, handle=None, file_id=file_id, verified=verified)
-
-        if not AUTO_IG_VERIFY and ADMIN_USER_ID:
-            await context.bot.send_message(
-                chat_id=ADMIN_USER_ID,
-                text=f"🧾 <b>IG запрос (скрин)</b>\nuser_id: <code>{user.id}</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ig_admin_kb(user.id),
+    # If waiting for IG proof
+    if context.user_data.get("await_ig_proof"):
+        with db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO ig_requests (user_id, ig_handle, note, created_at) VALUES (?, ?, ?, ?)",
+                (u.id, "", "photo proof received", now_utc().isoformat())
             )
+            conn.execute("UPDATE users SET ig_pending=1 WHERE user_id=?", (u.id,))
+            conn.commit()
 
-        context.user_data["await_ig"] = False
+        context.user_data["await_ig_proof"] = False
 
-        if await require_access(update, context):
-            await update.effective_message.reply_text("✅ Скрин принят. Меню 👇", reply_markup=main_menu_kb())
-        else:
-            await update.effective_message.reply_text("✅ Скрин принят. Подпишись на канал и/или дождись подтверждения.", reply_markup=gate_kb())
+        if AUTO_IG_VERIFY:
+            with db() as conn:
+                conn.execute("UPDATE users SET ig_verified=1, ig_pending=0 WHERE user_id=?", (u.id,))
+                conn.execute("DELETE FROM ig_requests WHERE user_id=?", (u.id,))
+                conn.commit()
+            await update.effective_message.reply_text(
+                fmt_header("Готово ✅")
+                + "Instagram подтвержден (auto). Доступ открыт 🎉",
+                reply_markup=main_menu(),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        await update.effective_message.reply_text(
+            fmt_header("Принято ✅")
+            + "Я подтвержу и открою доступ.\n\n"
+            "Если нужно быстрее — напиши мне: «проверь IG в боте».",
+            reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML
+        )
+        if ADMIN_USER_ID:
+            try:
+                await context.bot.send_message(
+                    ADMIN_USER_ID,
+                    f"IG-заявка (скрин): user_id={u.id}, username=@{u.username}\n"
+                    f"Подтверди: /ig_ok {u.id}  |  Отклонить: /ig_no {u.id}"
+                )
+            except Exception:
+                pass
         return
 
-    # ignore other photos
     if not await require_access(update, context):
         return
-    await update.effective_message.reply_text("Фото получено. Если это скрин IG — нажми «Подтвердить Instagram» в меню.", reply_markup=main_menu_kb())
+
+    await update.effective_message.reply_text(
+        "Фото получил ✅\n"
+        "Если хочешь — добавлю режим: «загрузить фото → сделать промт/оживление под Sora/Meta/HeyGen».",
+        reply_markup=main_menu()
+    )
 
 
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
+# -------------------- CALLBACK BUTTONS --------------------
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    u = update.effective_user
+    ensure_user(u)
+
+    if query.data == "check_channel":
+        ok = await is_subscribed_to_channel(context.bot, u.id)
+        if ok:
+            await safe_edit(
+                query,
+                fmt_header("Канал подтверждён ✅") + "Теперь подтвердим Instagram 👇",
+                reply_markup=instagram_gate_keyboard()
+            )
+        else:
+            await safe_edit(
+                query,
+                fmt_header("Подписка не найдена 😔")
+                + "Подпишись на канал и нажми «проверить» ещё раз.",
+                reply_markup=channel_gate_keyboard()
+            )
+        return
+
+    if query.data == "ig_request":
+        with db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO ig_requests (user_id, ig_handle, note, created_at) VALUES (?, ?, ?, ?)",
+                (u.id, "", "requested via button", now_utc().isoformat())
+            )
+            conn.execute("UPDATE users SET ig_pending=1 WHERE user_id=?", (u.id,))
+            conn.commit()
+
+        await safe_edit(
+            query,
+            fmt_header("Подтверждение Instagram ✅")
+            + "Отправь одним сообщением:\n"
+            "1) твой <b>@ник</b> в Instagram\n"
+            "2) потом можешь отправить <b>скрин</b> (если есть)\n\n"
+            "После этого доступ откроется.",
+            reply_markup=None
+        )
+        context.user_data["await_ig_info"] = True
+        context.user_data["await_ig_proof"] = True
+        return
+
+    if query.data == "vip_pay":
+        # send invoice in Stars (XTR)
+        # provider_token is empty string for Stars in many libs; Bot API uses XTR currency.
+        payload = f"vip:{u.id}:{int(time.time())}"
+        prices = [LabeledPrice(label=f"VIP {VIP_DAYS} дней", amount=VIP_PRICE_STARS)]
+        try:
+            await context.bot.send_invoice(
+                chat_id=u.id,
+                title="VIP подписка ⭐",
+                description=f"VIP на {VIP_DAYS} дней: до {VIP_DAILY_LIMIT}/день + приоритет.",
+                payload=payload,
+                provider_token="",  # Stars
+                currency="XTR",
+                prices=prices,
+                start_parameter="vip",
+            )
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO payments (user_id, payload, stars, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (u.id, payload, VIP_PRICE_STARS, "invoice_sent", now_utc().isoformat())
+                )
+                conn.commit()
+        except Exception as e:
+            await query.message.reply_text(f"Не смог отправить счёт: {e}")
+        return
+
+
+# -------------------- PAYMENTS --------------------
+async def on_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.pre_checkout_query
     try:
-        await query.answer(ok=True)
+        await q.answer(ok=True)
     except Exception:
         pass
 
-async def on_success_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    user = update.effective_user
-    if not msg or not user:
-        return
-    await db_add_vip_days(user.id, VIP_DAYS)
-    await msg.reply_text(f"✅ Оплата прошла! VIP активирован на {VIP_DAYS} дней ⭐️", reply_markup=main_menu_kb())
+async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user(u)
 
+    sp = update.effective_message.successful_payment
+    payload = sp.invoice_payload if sp else ""
+    stars = (sp.total_amount if sp else 0)
+
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO payments (user_id, payload, stars, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            (u.id, payload, stars, "paid", now_utc().isoformat())
+        )
+        conn.commit()
+
+    if payload.startswith("vip:"):
+        until = now_utc() + timedelta(days=VIP_DAYS)
+        with db() as conn:
+            conn.execute("UPDATE users SET vip_until=? WHERE user_id=?", (until.isoformat(), u.id))
+            conn.commit()
+        await update.effective_message.reply_text(
+            fmt_header("Оплата прошла ✅")
+            + f"VIP активирован до <b>{until.isoformat()}</b>\n\n"
+            "Спасибо 🤍",
+            reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Оплата прошла ✅",
+        reply_markup=main_menu()
+    )
+
+
+# -------------------- ERRORS --------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Что-то пошло не так, но я уже чиню. Нажми /start",
+            )
+    except Exception:
+        pass
 
-# -----------------------------
-# FastAPI webhook app
-# -----------------------------
-app = FastAPI()
-tg_app: Optional[Application] = None
 
-@app.get("/")
+# -------------------- FASTAPI ROUTES --------------------
+@app.get("/", response_class=PlainTextResponse)
 async def root():
-    return {"ok": True}
+    return "OK"
 
-@app.head("/")
-async def root_head():
-    return
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
+@app.post(WEBHOOK_PATH)
+async def webhook(req: Request):
+    if tg_app is None:
+        return {"ok": False, "error": "bot not ready"}
+    data = await req.json()
     update = Update.de_json(data, tg_app.bot)
     await tg_app.process_update(update)
     return {"ok": True}
 
+
+# -------------------- STARTUP/SHUTDOWN --------------------
 @app.on_event("startup")
-async def startup():
-    global tg_app
-    _db_init()
+async def on_startup():
+    global tg_app, BOT_USERNAME
+
+    init_db()
 
     tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    tg_app.add_handler(CommandHandler("start", cmd_start))
-    tg_app.add_handler(CommandHandler("menu", cmd_menu))
-    tg_app.add_handler(CommandHandler("myid", cmd_myid))
-    tg_app.add_handler(CommandHandler("reset", cmd_reset))
+    # commands
+    tg_app.add_handler(CommandHandler("start", start_cmd))
+    tg_app.add_handler(CommandHandler("help", help_cmd))
+    tg_app.add_handler(CommandHandler("myid", myid_cmd))
 
+    # admin
+    tg_app.add_handler(CommandHandler("ig_ok", ig_ok))
+    tg_app.add_handler(CommandHandler("ig_no", ig_no))
+    tg_app.add_handler(CommandHandler("vip_add", vip_add))
+
+    # payments
+    tg_app.add_handler(PreCheckoutQueryHandler(on_precheckout))
+    tg_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
+
+    # callbacks, photos, texts
     tg_app.add_handler(CallbackQueryHandler(on_button))
-    tg_app.add_handler(PreCheckoutQueryHandler(precheckout))
-    tg_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_success_payment))
-
     tg_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
@@ -756,20 +1067,20 @@ async def startup():
     await tg_app.initialize()
     await tg_app.start()
 
-    # set webhook
+    me = await tg_app.bot.get_me()
+    BOT_USERNAME = me.username
+    log.info("Bot username: %s", BOT_USERNAME)
+
     if WEBHOOK_BASE:
-        url = f"{WEBHOOK_BASE.rstrip('/')}/webhook"
-        await tg_app.bot.set_webhook(url=url)
-        me = await tg_app.bot.get_me()
-        log.info("Bot username: %s", me.username)
+        url = WEBHOOK_BASE + WEBHOOK_PATH
+        await tg_app.bot.set_webhook(url)
         log.info("Webhook set: %s", url)
+    else:
+        log.warning("WEBHOOK_BASE/WEBHOOK_URL/RENDER_EXTERNAL_URL not set. Webhook NOT configured.")
 
 @app.on_event("shutdown")
-async def shutdown():
+async def on_shutdown():
+    global tg_app
     if tg_app:
-        try:
-            await tg_app.bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
         await tg_app.stop()
         await tg_app.shutdown()
