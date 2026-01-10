@@ -1,996 +1,716 @@
 import os
-import re
 import io
-import time
 import base64
 import json
-import asyncio
-import logging
+import time
 import sqlite3
-import threading
-from datetime import datetime, timedelta, timezone
+import logging
+import asyncio
+from datetime import datetime, timedelta, date
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import PlainTextResponse
 
 from telegram import (
     Update,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.constants import ChatMemberStatus
-from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
-from openai import OpenAI
+# Optional OpenAI (images). Video part is guarded.
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
 
-# ----------------------------
-# Logging
-# ----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("gurenko-bot")
 
-# ----------------------------
-# ENV
-# ----------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# -------------------- CONFIG --------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("gurenko-bot")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is not set")
+
+# Webhook base url (Render): prefer WEBHOOK_URL, fallback to RENDER_EXTERNAL_URL
+WEBHOOK_BASE = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+WEBHOOK_PATH = "/webhook"
+
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@gurenko_kristina_ai").strip()
+CHANNEL_INVITE_URL = os.getenv("CHANNEL_INVITE_URL", "https://t.me/gurenko_kristina_ai").strip()
+
+INSTAGRAM_URL = os.getenv("INSTAGRAM_URL", "https://www.instagram.com/gurenko_kristina/").strip()
+
+# Admin (your Telegram numeric id)
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or "0")
+
+# Limits
+FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "1"))
+VIP_DAILY_LIMIT = int(os.getenv("VIP_DAILY_LIMIT", "30"))
+VIP_DURATION_DAYS = int(os.getenv("VIP_DURATION_DAYS", "30"))
+
+# Models
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # e.g. https://xxx.onrender.com/webhook
-REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()  # e.g. @gurenko_kristina_ai or -100xxxxxxxxxx
-
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1").strip()
 OPENAI_VIDEO_MODEL = os.getenv("OPENAI_VIDEO_MODEL", "sora-2").strip()
-OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini").strip()  # для "промт по фото"
 
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or "0")  # твой телеграм id (для /grantvip и /diag)
-
-TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "10") or "10")  # Владивосток/Приморье +10
-LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET_HOURS))
-
-# Лимиты
-FREE_DAILY_GENERATIONS = 1          # 1 в день бесплатно (фото ИЛИ видео)
-VIP_DAILY_GENERATIONS = 50          # для VIP (можешь менять)
-VIP_DURATION_DAYS = 30              # VIP на 30 дней
-
+# DB
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-if not WEBHOOK_URL:
-    raise RuntimeError("WEBHOOK_URL is not set")
-if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY is not set -> генерации работать не будут")
+# -------------------- APP/DB --------------------
+app = FastAPI()
+tg_app: Application | None = None
+BOT_USERNAME: str | None = None
 
-# ----------------------------
-# DB
-# ----------------------------
-_db_lock = threading.Lock()
-_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-_conn.row_factory = sqlite3.Row
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def db_init():
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("""
+def init_db():
+    with db() as conn:
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
             referred_by INTEGER,
-            created_at TEXT,
+            ref_count INTEGER DEFAULT 0,
+
+            ig_verified INTEGER DEFAULT 0,
             vip_until TEXT,
-            gen_credits INTEGER DEFAULT 0
-        )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            referrer_id INTEGER,
-            invited_id INTEGER,
-            created_at TEXT,
-            UNIQUE(referrer_id, invited_id)
-        )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS usage_daily (
-            user_id INTEGER,
-            day TEXT,
-            used INTEGER,
-            PRIMARY KEY(user_id, day)
-        )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS saved_prompts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            title TEXT,
-            prompt TEXT,
+
+            used_date TEXT,
+            used_count INTEGER DEFAULT 0,
+
+            bonus_credits INTEGER DEFAULT 0,
+
             created_at TEXT
         )
         """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS challenge (
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ig_requests (
             user_id INTEGER PRIMARY KEY,
-            day INTEGER DEFAULT 1,
-            started_at TEXT,
-            updated_at TEXT
+            ig_handle TEXT,
+            note TEXT,
+            created_at TEXT
         )
         """)
-        _conn.commit()
+        conn.commit()
 
-def now_local() -> datetime:
-    return datetime.now(LOCAL_TZ)
+def now_utc():
+    return datetime.utcnow()
 
-def today_key() -> str:
-    return now_local().strftime("%Y-%m-%d")
+def today_str():
+    return date.today().isoformat()
 
-def upsert_user(u: Update):
-    user = u.effective_user
-    if not user:
-        return
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("""
-        INSERT INTO users(user_id, username, first_name, created_at)
-        VALUES(?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
-        """, (user.id, user.username or "", user.first_name or "", now_local().isoformat()))
-        _conn.commit()
+def ensure_user(u):
+    with db() as conn:
+        row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (u.id,)).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO users (user_id, username, first_name, created_at) VALUES (?, ?, ?, ?)",
+                (u.id, u.username or "", u.first_name or "", now_utc().isoformat()),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET username=?, first_name=? WHERE user_id=?",
+                (u.username or "", u.first_name or "", u.id),
+            )
+        conn.commit()
 
 def get_user(user_id: int):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-        return cur.fetchone()
+    with db() as conn:
+        return conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
 
-def set_referred_by(user_id: int, referrer_id: int) -> bool:
-    """Set referred_by only if user has none. Return True if set now."""
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("SELECT referred_by FROM users WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            return False
-        if row["referred_by"]:
-            return False
-        cur.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer_id, user_id))
-        _conn.commit()
-        return True
+def set_referred(user_id: int, inviter_id: int):
+    with db() as conn:
+        me = conn.execute("SELECT referred_by FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not me:
+            return
+        if me["referred_by"]:
+            return  # already set
 
-def add_referral(referrer_id: int, invited_id: int) -> bool:
-    """Insert referral relation once. Return True if inserted."""
-    with _db_lock:
-        cur = _conn.cursor()
-        try:
-            cur.execute(
-                "INSERT INTO referrals(referrer_id, invited_id, created_at) VALUES(?,?,?)",
-                (referrer_id, invited_id, now_local().isoformat())
-            )
-            _conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
+        # don't self refer
+        if inviter_id == user_id:
+            return
 
-def count_referrals(referrer_id: int) -> int:
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (referrer_id,))
-        return int(cur.fetchone()["c"])
+        conn.execute("UPDATE users SET referred_by=? WHERE user_id=?", (inviter_id, user_id))
+        conn.execute("UPDATE users SET ref_count = ref_count + 1 WHERE user_id=?", (inviter_id,))
 
-def add_gen_credits(user_id: int, amount: int):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("UPDATE users SET gen_credits = COALESCE(gen_credits,0) + ? WHERE user_id=?",
-                    (amount, user_id))
-        _conn.commit()
+        # reward: +1 bonus credit per invite
+        conn.execute("UPDATE users SET bonus_credits = bonus_credits + 1 WHERE user_id=?", (inviter_id,))
+        conn.commit()
 
-def set_vip_until(user_id: int, until_dt: datetime):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("UPDATE users SET vip_until=? WHERE user_id=?",
-                    (until_dt.isoformat(), user_id))
-        _conn.commit()
-
-def is_vip(user_id: int) -> bool:
-    row = get_user(user_id)
+def is_vip(row) -> bool:
     if not row:
         return False
-    vip_until = row["vip_until"]
-    if not vip_until:
+    if not row["vip_until"]:
         return False
     try:
-        dt = datetime.fromisoformat(vip_until)
-        return dt > now_local()
+        dt = datetime.fromisoformat(row["vip_until"])
+        return dt > now_utc()
     except Exception:
         return False
 
-def daily_used(user_id: int) -> int:
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("SELECT used FROM usage_daily WHERE user_id=? AND day=?",
-                    (user_id, today_key()))
-        row = cur.fetchone()
-        return int(row["used"]) if row else 0
+def vip_until_text(row):
+    if not row or not row["vip_until"]:
+        return "нет"
+    return row["vip_until"].replace("T", " ")
 
-def set_daily_used(user_id: int, used: int):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("""
-        INSERT INTO usage_daily(user_id, day, used)
-        VALUES(?,?,?)
-        ON CONFLICT(user_id, day) DO UPDATE SET used=excluded.used
-        """, (user_id, today_key(), used))
-        _conn.commit()
-
-def consume_generation(user_id: int) -> tuple[bool, str]:
-    """
-    True if allowed and consumed. Logic:
-    - VIP: daily quota VIP_DAILY_GENERATIONS
-    - Free: daily quota FREE_DAILY_GENERATIONS
-    - If daily exceeded, try gen_credits (ref bonus).
-    """
-    row = get_user(user_id)
+def reset_daily_if_needed(row):
     if not row:
-        return False, "Пользователь не найден в базе."
+        return
+    td = today_str()
+    if row["used_date"] != td:
+        with db() as conn:
+            conn.execute("UPDATE users SET used_date=?, used_count=0 WHERE user_id=?", (td, row["user_id"]))
+            conn.commit()
 
-    used = daily_used(user_id)
-    quota = VIP_DAILY_GENERATIONS if is_vip(user_id) else FREE_DAILY_GENERATIONS
+def can_use_generation(row) -> tuple[bool, str]:
+    reset_daily_if_needed(row)
+    row = get_user(row["user_id"])  # refresh
+    vip = is_vip(row)
 
-    if used < quota:
-        set_daily_used(user_id, used + 1)
-        return True, f"✅ Лимит: {used+1}/{quota} за сегодня."
+    # bonus credits allow extra generations
+    bonus = int(row["bonus_credits"] or 0)
+    if bonus > 0:
+        return True, f"🎁 У тебя есть бонус: {bonus} доп. генераций."
 
-    credits = int(row["gen_credits"] or 0)
-    if credits > 0:
-        # consume credit
-        with _db_lock:
-            cur = _conn.cursor()
-            cur.execute("UPDATE users SET gen_credits = gen_credits - 1 WHERE user_id=?", (user_id,))
-            _conn.commit()
-        return True, f"✅ Использован бонусный кредит. Осталось: {credits-1}."
+    limit = VIP_DAILY_LIMIT if vip else FREE_DAILY_LIMIT
+    used = int(row["used_count"] or 0)
+    if used >= limit:
+        if vip:
+            return False, f"Лимит на сегодня исчерпан: {used}/{limit} (VIP)."
+        return False, f"Лимит на сегодня исчерпан: {used}/{limit}. Завтра будет доступно снова."
+    return True, f"Осталось на сегодня: {limit - used}."
 
-    return False, f"⛔️ Лимит на сегодня исчерпан ({quota}/{quota}).\n\n💎 Хочешь больше — VIP на 30 дней."
+def consume_generation(row):
+    reset_daily_if_needed(row)
+    row = get_user(row["user_id"])
 
-def save_prompt(user_id: int, title: str, prompt: str):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("""
-        INSERT INTO saved_prompts(user_id, title, prompt, created_at)
-        VALUES(?,?,?,?)
-        """, (user_id, title[:80], prompt, now_local().isoformat()))
-        _conn.commit()
+    bonus = int(row["bonus_credits"] or 0)
+    with db() as conn:
+        if bonus > 0:
+            conn.execute("UPDATE users SET bonus_credits = bonus_credits - 1 WHERE user_id=?", (row["user_id"],))
+        else:
+            conn.execute("UPDATE users SET used_count = used_count + 1, used_date=? WHERE user_id=?",
+                         (today_str(), row["user_id"]))
+        conn.commit()
 
-def list_prompts(user_id: int, limit: int = 10):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("""
-        SELECT id, title, created_at FROM saved_prompts
-        WHERE user_id=?
-        ORDER BY id DESC
-        LIMIT ?
-        """, (user_id, limit))
-        return cur.fetchall()
-
-def get_prompt(user_id: int, prompt_id: int):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("""
-        SELECT * FROM saved_prompts
-        WHERE user_id=? AND id=?
-        """, (user_id, prompt_id))
-        return cur.fetchone()
-
-def challenge_get(user_id: int):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("SELECT * FROM challenge WHERE user_id=?", (user_id,))
-        return cur.fetchone()
-
-def challenge_start(user_id: int):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("""
-        INSERT INTO challenge(user_id, day, started_at, updated_at)
-        VALUES(?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            day=1,
-            started_at=excluded.started_at,
-            updated_at=excluded.updated_at
-        """, (user_id, 1, today_key(), today_key()))
-        _conn.commit()
-
-def challenge_advance(user_id: int):
-    with _db_lock:
-        cur = _conn.cursor()
-        cur.execute("""
-        INSERT INTO challenge(user_id, day, started_at, updated_at)
-        VALUES(?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            day=challenge.day + 1,
-            updated_at=excluded.updated_at
-        """, (user_id, 1, today_key(), today_key()))
-        _conn.commit()
-
-# ----------------------------
-# Content: Prompt of the day & Challenge 30 days
-# ----------------------------
-PROMPT_OF_DAY = [
-    # Можно расширять сколько хочешь
-    "Ультра-реалистичный портрет, fashion-editorial, зимний свет, микротекстура кожи, натуральные поры, без пластика.",
-    "Кинематографичный кадр: тёплый интерьер, мягкий боке, естественный шум плёнки, живые тени, настоящая кожа.",
-    "Улица ночь: неоновые отражения на мокром асфальте, контрастный свет, без кукольного лица, реализм.",
-    "Глянцевый beauty-close-up: ресницы со снежинками, морозная дымка, высокая детализация, без искажений.",
-    "Портрет на 85mm: натуральный цвет кожи, без сглаживания, мягкий rim light, editorial-стиль.",
-]
-
-CHALLENGE_30 = [
-    {"title": "Реалистичная кожа", "task": "Сделай фото, где кожа выглядит как в жизни: поры, лёгкий пушок, микротекстура.", "hint": "Добавь: micro skin texture, realistic pores, no doll skin."},
-    {"title": "Естественный свет", "task": "Сделай фото с мягким дневным светом из окна + правильные тени.", "hint": "Добавь: soft window light, natural shadows."},
-    {"title": "Кино-кадр", "task": "Кинематографичный портрет: глубина резкости, лёгкое зерно, драматичный свет.", "hint": "Добавь: cinematic grading, subtle film grain."},
-    {"title": "Ночь/неон", "task": "Улица ночью + неоновые отражения, реализм лица без пластика.", "hint": "Добавь: wet asphalt reflections, neon glow."},
-    {"title": "Снег и детали", "task": "Зимний кадр со снегом на волосах/одежде, без “игрушечной” фактуры.", "hint": "Добавь: snow particles, realistic fabric weave."},
-    {"title": "Видео 4 секунды", "task": "Сгенерируй видео 4 сек: лёгкое движение камеры (пан/тилт), естественная мимика.", "hint": "Добавь: subtle camera movement, natural facial motion."},
-    {"title": "Говорящая голова (сцена)", "task": "Видео: персонаж говорит 1–2 фразы, движение губ естественное.", "hint": "Добавь: realistic lip motion, calm breathing."},
-    {"title": "Рекламный кадр", "task": "Сделай картинку как бренд-реклама: чистый фон, премиум-свет, аккуратный стиль.", "hint": "Добавь: studio softbox lighting, premium look."},
-    {"title": "Детали ткани", "task": "Фото с акцентом на ткань: шуба/куртка/шарф, видны волокна.", "hint": "Добавь: detailed fabric texture, visible fibers."},
-    {"title": "Сторителлинг кадра", "task": "Сделай кадр, где есть история: взгляд, действие, эмоция.", "hint": "Добавь: candid moment, authentic emotion."},
-    # 11–30 (можешь менять под свой стиль)
-    {"title": "Крупный план (beauty)", "task": "Супер-крупный план лица: глаза/ресницы/кожа — реализм.", "hint": "85mm, macro detail, no over-smoothing."},
-    {"title": "Портрет + контровой свет", "task": "Контровой свет по волосам, мягкие тени на лице.", "hint": "rim light, soft shadows."},
-    {"title": "Снегопад в движении", "task": "Видео: снежинки летят, камера чуть двигается.", "hint": "falling snow particles, gentle pan."},
-    {"title": "Тёплый интерьер", "task": "Фото в тёплом свете: лампы, уют, естественные цвета.", "hint": "warm tungsten lighting, cozy mood."},
-    {"title": "Глянец/журнал", "task": "Журнальная подача: поза, свет, чистый фон.", "hint": "editorial pose, glossy magazine."},
-    {"title": "Сцена “до/после”", "task": "Сделай 2 варианта промта: обычный и PRO (с негативом и настройками).", "hint": "Сравни результат."},
-    {"title": "Хук для Reels", "task": "Придумай хук 1–2 секунды под свой стиль + текст на экране.", "hint": "коротко и резко."},
-    {"title": "Разбор ролика", "task": "Возьми свой ролик и выпиши 3 улучшения: хук/монтаж/CTA.", "hint": "Пиши конкретно."},
-    {"title": "Серия 3 кадров", "task": "Сделай 3 фото в одном стиле (цвет, свет, камера).", "hint": "consistency, same lens."},
-    {"title": "Вариативность 3 промта", "task": "Один сюжет — 3 варианта промта (свет/камера/стиль).", "hint": "вариации."},
-    {"title": "Стрит-фото", "task": "Фото как случайный снимок на улице, но красиво.", "hint": "candid street photo."},
-    {"title": "Тени на лице", "task": "Фото с интересными тенями (жалюзи/ветки/окно).", "hint": "patterned shadows."},
-    {"title": "Свет от витрины", "task": "Ночной кадр: свет от витрины/фонаря, реализм.", "hint": "shop window light."},
-    {"title": "Мини-сцена 4 сек", "task": "Видео: шаг/поворот головы/улыбка — естественно.", "hint": "subtle motion."},
-    {"title": "Боке и глубина", "task": "Портрет с красивым боке и резкостью по глазам.", "hint": "shallow depth of field."},
-    {"title": "Ретушь без пластика", "task": "Улучши лицо, но оставь кожу живой.", "hint": "no plastic skin."},
-    {"title": "Стиль “как у Кристины”", "task": "Собери шаблон: хук → промт → настройки → подпись → 5 тегов.", "hint": "в одном сообщении."},
-    {"title": "Шеринг", "task": "Сделай такой результат, чтобы хотелось отправить другу (вау-идея).", "hint": "концепт > техника."},
-    {"title": "Финал", "task": "Сделай лучший ролик недели: коротко, сильно, с CTA.", "hint": "закрепи результат."},
-]
-
-# ----------------------------
-# OpenAI client
-# ----------------------------
-oa_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-async def run_in_thread(fn, *args, **kwargs):
-    return await asyncio.to_thread(fn, *args, **kwargs)
-
-def openai_generate_image(prompt: str) -> bytes:
-    """
-    Returns image bytes (PNG/JPG depending).
-    Uses Images API, which returns base64 for GPT image models. :contentReference[oaicite:3]{index=3}
-    """
-    if not oa_client:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    res = oa_client.images.generate(
-        model=OPENAI_IMAGE_MODEL,
-        prompt=prompt,
-        size="1024x1024",
-    )
-    b64 = res.data[0].b64_json
-    return base64.b64decode(b64)
-
-def openai_create_video(prompt: str, seconds: str = "4", size: str = "720x1280") -> bytes:
-    """
-    Create video job and download content.
-    API: videos.create / videos.retrieve / videos.download_content :contentReference[oaicite:4]{index=4}
-    """
-    if not oa_client:
-        raise RuntimeError("OPENAI_API_KEY not set")
-
-    job = oa_client.videos.create(
-        model=OPENAI_VIDEO_MODEL,
-        prompt=prompt,
-        seconds=seconds,   # "4" | "8" | "12" (по докам) :contentReference[oaicite:5]{index=5}
-        size=size,         # "720x1280" | "1280x720" | ...
-    )
-
-    # poll until done
-    video_id = job.id
-    for _ in range(60):  # ~до 60 попыток
-        time.sleep(2)
-        st = oa_client.videos.retrieve(video_id)
-        if st.status in ("succeeded", "failed", "cancelled"):
-            job = st
-            break
-
-    if job.status != "succeeded":
-        err = getattr(job, "error", None)
-        raise RuntimeError(f"Video job failed: status={job.status} error={err}")
-
-    response = oa_client.videos.download_content(video_id=video_id)
-    content = response.read()
-    return content
-
-def openai_prompt_from_photo(image_bytes: bytes, goal_text: str) -> str:
-    """
-    Создаёт пакет: prompt + negative + settings.
-    Делается через Responses (vision).
-    """
-    if not oa_client:
-        raise RuntimeError("OPENAI_API_KEY not set")
-
-    data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("utf-8")
-
-    system = (
-        "Ты — эксперт по промтам для Sora/Meta/HeyGen. "
-        "Сделай ответ строго структурированно:\n"
-        "1) PROMPT (для фото)\n"
-        "2) PROMPT (для видео)\n"
-        "3) NEGATIVE PROMPT\n"
-        "4) 3 настройки (качество/свет/камера)\n"
-        "Пиши по-русски, коротко, но мощно."
-    )
-
-    user = (
-        f"На фото человек/сцена. Цель пользователя: {goal_text}\n"
-        f"Сохрани реализм, не меняй личность. Укажи анти-кукла и анти-искажения."
-    )
-
-    resp = oa_client.responses.create(
-        model=OPENAI_TEXT_MODEL,
-        input=[
-            {"role": "system", "content": [{"type": "input_text", "text": system}]},
-            {"role": "user", "content": [
-                {"type": "input_text", "text": user},
-                {"type": "input_image", "image_url": data_url},
-            ]},
-        ],
-    )
-    return resp.output_text
-
-# ----------------------------
-# Telegram UI
-# ----------------------------
-def main_menu_kb(bot_username: str, user_id: int) -> InlineKeyboardMarkup:
-    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-    share_url = "https://t.me/share/url?url=" + quote(ref_link) + "&text=" + quote("Забирай бота с промтами и генерацией 👇")
-    kb = [
-        [InlineKeyboardButton("🧠 Сделай промт по фото", callback_data="p_photo")],
-        [InlineKeyboardButton("🖼️ Сгенерировать ФОТО (Sora)", callback_data="gen_img")],
-        [InlineKeyboardButton("🎬 Сгенерировать ВИДЕО (Sora)", callback_data="gen_vid")],
-        [InlineKeyboardButton("🎁 Промт дня", callback_data="pod")],
-        [InlineKeyboardButton("🏆 Челлендж 30 дней", callback_data="ch_menu")],
-        [InlineKeyboardButton("📌 Мои промты", callback_data="my_prompts")],
-        [InlineKeyboardButton("👥 Пригласить друга (бонусы)", callback_data="ref")],
-        [InlineKeyboardButton("📤 Поделиться ботом", url=share_url)],
-        [InlineKeyboardButton("💎 VIP на 30 дней", callback_data="vip")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-def subscribe_kb() -> InlineKeyboardMarkup:
-    if REQUIRED_CHANNEL.startswith("@"):
-        url = f"https://t.me/{REQUIRED_CHANNEL[1:]}"
-    else:
-        url = "https://t.me/"  # fallback
-    kb = [
-        [InlineKeyboardButton("✅ Подписаться на канал", url=url)],
-        [InlineKeyboardButton("🔄 Проверить подписку", callback_data="check_sub")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-async def is_channel_member(bot, user_id: int) -> bool:
-    if not REQUIRED_CHANNEL:
-        return True  # если канал не задан — не блокируем
+async def is_subscribed_to_channel(bot, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
+        # member.status can be: creator/administrator/member/restricted/left/kicked
+        if member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return True
+        # restricted может быть подпиской с ограничениями — считаем как подписан, если не left/kicked
+        if member.status == ChatMemberStatus.RESTRICTED:
+            return True
+        return False
     except Exception as e:
-        logger.warning(f"get_chat_member failed: {e}")
+        log.warning("channel check failed: %s", e)
+        # If bot has no access to channel member list, you can disable strict check
         return False
 
-async def gate_or_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Return True if allowed, else show subscribe message and return False."""
-    uid = update.effective_user.id
-    ok = await is_channel_member(context.bot, uid)
-    if ok:
-        return True
-
-    text = (
-        "🔒 Доступ к генерации и премиум-функциям — только для подписчиков канала.\n\n"
-        "Подпишись и нажми «Проверить подписку» ✅"
-    )
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.message.reply_text(text, reply_markup=subscribe_kb())
-    else:
-        await update.message.reply_text(text, reply_markup=subscribe_kb())
-    return False
-
-async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str | None = None):
-    me = await context.bot.get_me()
-    bot_username = me.username
-    uid = update.effective_user.id
-    row = get_user(uid)
-    vip_flag = "💎 VIP активен" if is_vip(uid) else "🆓 Free"
-    credits = int(row["gen_credits"] or 0) if row else 0
-
-    header = text or "Выбери действие 👇"
-    status = f"\n\nСтатус: {vip_flag}\nСегодня использовано: {daily_used(uid)}/{VIP_DAILY_GENERATIONS if is_vip(uid) else FREE_DAILY_GENERATIONS}\nБонус-кредиты: {credits}"
-    await update.effective_message.reply_text(header + status, reply_markup=main_menu_kb(bot_username, uid))
-
-# ----------------------------
-# Handlers
-# ----------------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user(update)
-
-    uid = update.effective_user.id
-    args = context.args or []
-    if args:
-        m = re.match(r"ref_(\d+)", args[0])
-        if m:
-            referrer_id = int(m.group(1))
-            if referrer_id != uid:
-                # set referred_by once
-                if set_referred_by(uid, referrer_id):
-                    inserted = add_referral(referrer_id, uid)
-                    if inserted:
-                        # rewards:
-                        # 1 invite -> +5 generation credits
-                        # 3 invites -> VIP 3 days
-                        c = count_referrals(referrer_id)
-                        if c == 1:
-                            add_gen_credits(referrer_id, 5)
-                        if c == 3:
-                            set_vip_until(referrer_id, now_local() + timedelta(days=3))
-
-    await send_menu(update, context, text="Привет! Я бот Кристины 🤍\nПромты + генерация Фото/Видео + челленджи.")
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Команды:\n"
-        "/start — меню\n"
-        "/balance — статус/лимиты\n"
-        "/diag — диагностика (для админа)\n"
+def main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🖼 Сгенерировать фото"), KeyboardButton("🎬 Сгенерировать видео")],
+            [KeyboardButton("🎁 Промт дня"), KeyboardButton("📆 Челлендж 30 дней")],
+            [KeyboardButton("🎁 Пригласить друга"), KeyboardButton("⭐️ VIP / Подписка")],
+            [KeyboardButton("✅ Проверить Instagram"), KeyboardButton("ℹ️ Помощь")],
+        ],
+        resize_keyboard=True
     )
 
-async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    row = get_user(uid)
-    if not row:
-        await update.message.reply_text("Нет данных. Нажми /start")
-        return
-    vip = is_vip(uid)
-    vip_until = row["vip_until"] or "-"
-    used = daily_used(uid)
-    quota = VIP_DAILY_GENERATIONS if vip else FREE_DAILY_GENERATIONS
-    credits = int(row["gen_credits"] or 0)
-    await update.message.reply_text(
-        f"Статус: {'VIP 💎' if vip else 'Free 🆓'}\n"
-        f"VIP до: {vip_until}\n"
-        f"Сегодня: {used}/{quota}\n"
-        f"Бонус-кредиты: {credits}\n"
-    )
+def share_keyboard(user_id: int):
+    global BOT_USERNAME
+    bot_un = BOT_USERNAME or "your_bot_username"
+    deep = f"https://t.me/{bot_un}?start=ref_{user_id}"
+    share_url = f"https://t.me/share/url?url={quote(deep)}&text={quote('Смотри, бот с промтами и генерацией фото/видео 👇')}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Поделиться ботом", url=share_url)],
+        [InlineKeyboardButton("🔗 Открыть ссылку приглашения", url=deep)],
+    ])
 
-async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if ADMIN_USER_ID and uid != ADMIN_USER_ID:
-        await update.message.reply_text("⛔️ Нет доступа.")
-        return
+def channel_gate_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подписаться на канал", url=CHANNEL_INVITE_URL)],
+        [InlineKeyboardButton("🔁 Я подписался — проверить", callback_data="check_channel")]
+    ])
 
-    msg = []
-    msg.append(f"OPENAI_IMAGE_MODEL={OPENAI_IMAGE_MODEL}")
-    msg.append(f"OPENAI_VIDEO_MODEL={OPENAI_VIDEO_MODEL}")
-    msg.append(f"OPENAI_TEXT_MODEL={OPENAI_TEXT_MODEL}")
-    msg.append(f"API key set: {'YES' if bool(OPENAI_API_KEY) else 'NO'}")
+def instagram_gate_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📷 Открыть Instagram", url=INSTAGRAM_URL)],
+        [InlineKeyboardButton("✅ Я подписался — отправить заявку", callback_data="ig_request")]
+    ])
 
-    # Try list models (best-effort)
-    if oa_client:
-        try:
-            models = oa_client.models.list()
-            names = [m.id for m in models.data]
-            msg.append(f"Models visible: {len(names)}")
-            msg.append(f"Has image model? {'YES' if OPENAI_IMAGE_MODEL in names else 'NO/UNKNOWN'}")
-            msg.append(f"Has video model? {'YES' if OPENAI_VIDEO_MODEL in names else 'NO/UNKNOWN'}")
-        except Exception as e:
-            msg.append(f"models.list failed: {repr(e)}")
+async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Return True if user can continue, else show gates and return False."""
+    u = update.effective_user
+    ensure_user(u)
 
-    await update.message.reply_text("\n".join(msg))
-
-async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    uid = update.effective_user.id
-    upsert_user(update)
-
-    data = q.data
-
-    if data == "check_sub":
-        ok = await is_channel_member(context.bot, uid)
-        if ok:
-            await q.message.reply_text("✅ Подписка подтверждена! Открываю меню.")
-            await send_menu(update, context)
-        else:
-            await q.message.reply_text("⛔️ Я всё ещё не вижу подписку. Проверь, что подписалась на канал и попробуй снова.")
-        return
-
-    # Gate most actions
-    if data in ("gen_img", "gen_vid", "p_photo", "my_prompts", "ch_menu", "ref", "vip"):
-        allowed = await gate_or_menu(update, context)
-        if not allowed:
-            return
-
-    if data == "pod":
-        # Prompt of day доступен всем (можешь тоже загейтить)
-        i = int(now_local().strftime("%j")) % len(PROMPT_OF_DAY)
-        p = PROMPT_OF_DAY[i]
+    # 1) Telegram channel subscription gate
+    ok = await is_subscribed_to_channel(context.bot, u.id)
+    if not ok:
         text = (
-            "🎁 *Промт дня*\n\n"
-            f"`{p}`\n\n"
-            "Негатив:\n"
-            "`doll face, plastic skin, over-smoothing, deformed hands, extra fingers, bad anatomy, blur`\n\n"
-            "Настройки:\n"
-            "• Качество: max / 4K\n• Свет: soft + natural shadows\n• Камера: 85mm, shallow depth of field"
+            "🔒 Чтобы пользоваться ботом, нужно быть подписанным на мой Telegram-канал.\n\n"
+            "Нажми «Подписаться», потом «Я подписался — проверить»."
         )
-        await q.message.reply_text(text, parse_mode="Markdown")
-        return
+        await update.effective_message.reply_text(text, reply_markup=channel_gate_keyboard())
+        return False
 
-    if data == "gen_img":
-        ok, info = consume_generation(uid)
-        if not ok:
-            await q.message.reply_text(info)
-            return
-        context.user_data["awaiting"] = "img_prompt"
-        await q.message.reply_text(
-            "🖼️ Напиши промт для ФОТО.\n\n"
-            "Пример: *ультра-реалистичный зимний fashion-editorial портрет, 85mm, micro skin texture…*",
-            parse_mode="Markdown"
+    # 2) Instagram verification gate (manual approval flow)
+    row = get_user(u.id)
+    if int(row["ig_verified"] or 0) != 1:
+        text = (
+            "🔒 Ещё один шаг: подтверждение подписки на Instagram.\n\n"
+            "Почему так? Instagram не даёт надёжную авто-проверку подписки через бота.\n"
+            "Поэтому ты отправляешь заявку, а я подтверждаю — и бот открывается полностью.\n\n"
+            "Нажми кнопку ниже 👇"
         )
-        await q.message.reply_text(info)
-        return
+        await update.effective_message.reply_text(text, reply_markup=instagram_gate_keyboard())
+        return False
 
-    if data == "gen_vid":
-        ok, info = consume_generation(uid)
-        if not ok:
-            await q.message.reply_text(info)
-            return
-        context.user_data["awaiting"] = "vid_prompt"
-        await q.message.reply_text(
-            "🎬 Напиши промт для ВИДЕО.\n\n"
-            "Я сделаю клип 4 секунды (вертикальный 720×1280).",
-            parse_mode="Markdown"
+    return True
+
+
+# -------------------- OPENAI HELPERS --------------------
+def get_openai_client():
+    if not (OPENAI_AVAILABLE and OPENAI_API_KEY):
+        return None
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+def openai_generate_image(prompt: str) -> tuple[bytes | None, str | None]:
+    """
+    Returns (png_bytes, error_message)
+    """
+    client = get_openai_client()
+    if not client:
+        return None, "OpenAI API не настроен (нет OPENAI_API_KEY)."
+
+    try:
+        # gpt-image-1 returns base64 in data[0].b64_json (commonly)
+        res = client.images.generate(
+            model=OPENAI_IMAGE_MODEL,
+            prompt=prompt,
+            size="1024x1024"
         )
-        await q.message.reply_text(info)
-        return
+        data0 = res.data[0]
+        b64 = getattr(data0, "b64_json", None) or data0.get("b64_json")
+        if not b64:
+            return None, "Не пришли данные изображения (b64_json пуст)."
+        img = base64.b64decode(b64)
+        return img, None
+    except Exception as e:
+        return None, f"Не удалось сгенерировать фото: {e}"
 
-    if data == "p_photo":
-        context.user_data["awaiting"] = "photo_for_prompt"
-        await q.message.reply_text(
-            "🧠 Пришли фото (как документ или обычным фото).\n"
-            "После фото я спрошу: *что хочешь получить?* и соберу промт + негатив + настройки."
-        )
-        return
-
-    if data == "ref":
-        me = await context.bot.get_me()
-        bot_username = me.username
-        ref_link = f"https://t.me/{bot_username}?start=ref_{uid}"
-        c = count_referrals(uid)
-        await q.message.reply_text(
-            "👥 *Реферальная программа*\n\n"
-            f"Твоя ссылка:\n{ref_link}\n\n"
-            "Награды:\n"
-            "• 1 приглашённый → +5 генераций (кредиты)\n"
-            "• 3 приглашённых → VIP на 3 дня\n\n"
-            f"Приглашено: {c}",
-            parse_mode="Markdown"
-        )
-        return
-
-    if data == "vip":
-        await q.message.reply_text(
-            "💎 *VIP на 30 дней*\n\n"
-            "Что даёт:\n"
-            f"• до {VIP_DAILY_GENERATIONS} генераций/день\n"
-            "• PRO-шаблоны промтов\n"
-            "• быстрые разборы\n\n"
-            "Оплата Stars/магазин можно подключить отдельно.\n"
-            "Пока что VIP выдаётся вручную админом командой /grantvip (если хочешь — добавлю оплату позже).",
-            parse_mode="Markdown"
-        )
-        return
-
-    if data == "my_prompts":
-        rows = list_prompts(uid, limit=10)
-        if not rows:
-            await q.message.reply_text("📌 У тебя пока нет сохранённых промтов.\nПосле выдачи промта нажимай «Сохранить».")
-            return
-        lines = ["📌 *Мои промты* (последние 10):\n"]
-        for r in rows:
-            lines.append(f"• #{r['id']}: {r['title']} ({r['created_at'][:10]})")
-        lines.append("\nЧтобы открыть: отправь команду `#ID` (например `#12`).")
-        await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
-        return
-
-    if data == "ch_menu":
-        st = challenge_get(uid)
-        if not st:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Старт", callback_data="ch_start")]])
-            await q.message.reply_text("🏆 Челлендж 30 дней.\nНажми «Старт» и каждый день делай задание.", reply_markup=kb)
-        else:
-            day = int(st["day"])
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Готово → следующий день", callback_data="ch_done")],
-                [InlineKeyboardButton("📄 Показать задание", callback_data="ch_show")],
-            ])
-            await q.message.reply_text(f"🏆 Ты в челлендже. Текущий день: {day}/30", reply_markup=kb)
-        return
-
-    if data == "ch_start":
-        challenge_start(uid)
-        await send_challenge_day(update, context, 1)
-        return
-
-    if data == "ch_show":
-        st = challenge_get(uid)
-        day = int(st["day"]) if st else 1
-        await send_challenge_day(update, context, day)
-        return
-
-    if data == "ch_done":
-        st = challenge_get(uid)
-        day = int(st["day"]) if st else 1
-        if day >= 30:
-            await q.message.reply_text("🎉 Ты прошла челлендж 30/30! Хочешь — сделаю “следующий сезон” челленджа.")
-            return
-        challenge_advance(uid)
-        await send_challenge_day(update, context, day + 1)
-        return
-
-async def send_challenge_day(update: Update, context: ContextTypes.DEFAULT_TYPE, day: int):
-    day = max(1, min(30, day))
-    item = CHALLENGE_30[day - 1]
-    text = (
-        f"🏆 *День {day}/30 — {item['title']}*\n\n"
-        f"{item['task']}\n\n"
-        f"Подсказка: `{item['hint']}`"
+def openai_generate_video_stub(prompt: str) -> tuple[None, str]:
+    """
+    ВНИМАНИЕ: у Sora видео API есть отдельные эндпоинты/форматы.
+    Чтобы код не падал на несовместимых SDK/доступах, здесь безопасная заглушка.
+    """
+    return None, (
+        "🎬 Видео сейчас недоступно через API в этом деплое.\n\n"
+        "Причины обычно такие:\n"
+        "• у аккаунта API нет доступа к Sora-модели;\n"
+        "• не включён billing/лимиты;\n"
+        "• нужен новый SDK и реализация под /v1/videos.\n\n"
+        "Если хочешь — я дам точную реализацию под твой SDK/эндпоинт, "
+        "но сначала нужно убедиться, что в API вообще доступна Sora-модель."
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово → следующий день", callback_data="ch_done")]])
-    if update.callback_query:
-        await update.callback_query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-    else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
-async def cmd_grantvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if ADMIN_USER_ID and uid != ADMIN_USER_ID:
-        await update.message.reply_text("⛔️ Нет доступа.")
+
+# -------------------- HANDLERS --------------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_USERNAME
+    u = update.effective_user
+    ensure_user(u)
+
+    # parse referral
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("ref_"):
+            try:
+                inviter = int(arg.replace("ref_", "").strip())
+                set_referred(u.id, inviter)
+            except Exception:
+                pass
+
+    if BOT_USERNAME is None:
+        me = await context.bot.get_me()
+        BOT_USERNAME = me.username
+
+    # greeting
+    text = (
+        "Привет! Я — бот Кристины 🤍\n\n"
+        "Что умею:\n"
+        "• 🖼 Генерация фото (через OpenAI Images API)\n"
+        "• 🎬 Генерация видео (Sora) — если доступна в твоём API\n"
+        "• 🎁 «Промт дня» и 📆 челлендж на 30 дней\n"
+        "• 🎁 Реферальная ссылка: приглашай друзей и получай бонус-генерации\n\n"
+        f"Лимит: бесплатно — {FREE_DAILY_LIMIT} генерация/день (фото ИЛИ видео). "
+        f"VIP — до {VIP_DAILY_LIMIT}/день на {VIP_DURATION_DAYS} дней.\n\n"
+        "Нажми кнопку в меню 👇"
+    )
+    await update.message.reply_text(text, reply_markup=main_menu())
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
         return
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /grantvip <user_id> <days>")
-        return
-    target = int(context.args[0])
-    days = int(context.args[1])
-    set_vip_until(target, now_local() + timedelta(days=days))
-    await update.message.reply_text(f"✅ VIP выдан пользователю {target} на {days} дней.")
+    row = get_user(update.effective_user.id)
+    ok, msg = can_use_generation(row)
+    text = (
+        "ℹ️ Помощь\n\n"
+        "🖼 Сгенерировать фото — отправь текст-описание, получишь картинку.\n"
+        "🎬 Сгенерировать видео — отправь описание (если Sora доступна).\n"
+        "🎁 Пригласить друга — бот даст ссылку, по ней друзья заходят и тебе капают бонусы.\n\n"
+        f"Статус VIP: {'активен ✅' if is_vip(row) else 'нет ❌'}\n"
+        f"VIP до: {vip_until_text(row)}\n"
+        f"{msg}\n"
+    )
+    await update.effective_message.reply_text(text, reply_markup=main_menu())
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    upsert_user(update)
+    txt = (update.effective_message.text or "").strip()
+    u = update.effective_user
+    ensure_user(u)
 
-    # open saved prompt by #ID
-    m = re.match(r"#(\d+)", (update.message.text or "").strip())
-    if m:
-        if not await gate_or_menu(update, context):
-            return
-        pid = int(m.group(1))
-        row = get_prompt(uid, pid)
-        if not row:
-            await update.message.reply_text("Не найдено.")
-            return
-        await update.message.reply_text(f"📌 *{row['title']}*\n\n{row['prompt']}", parse_mode="Markdown")
+    # menu actions that require access
+    if txt in ("🖼 Сгенерировать фото", "🎬 Сгенерировать видео", "🎁 Промт дня",
+               "📆 Челлендж 30 дней", "🎁 Пригласить друга", "⭐️ VIP / Подписка",
+               "✅ Проверить Instagram", "ℹ️ Помощь"):
+        pass
+
+    if txt == "✅ Проверить Instagram":
+        # allow request even without full access
+        await update.effective_message.reply_text(
+            "Подпишись на Instagram и нажми кнопку ниже, чтобы отправить заявку.\n"
+            "В заявке укажи свой @ник и (по возможности) прикрепи скрин подписки.\n\n"
+            f"Instagram: {INSTAGRAM_URL}",
+            reply_markup=instagram_gate_keyboard(),
+        )
         return
 
-    awaiting = context.user_data.get("awaiting")
-
-    if awaiting == "img_prompt":
-        prompt = update.message.text.strip()
-        context.user_data["awaiting"] = None
-        await update.message.reply_text("⏳ Генерирую фото…")
-        try:
-            img_bytes = await run_in_thread(openai_generate_image, prompt)
-            await update.message.reply_photo(photo=img_bytes, caption="🖼️ Готово!")
-            # offer save
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📌 Сохранить в мои промты", callback_data="save_last")],
-            ])
-            context.user_data["last_prompt"] = prompt
-            await update.message.reply_text("Хочешь сохранить этот промт?", reply_markup=kb)
-        except Exception as e:
-            logger.exception("image gen failed")
-            await update.message.reply_text(f"⛔️ Не удалось сгенерировать фото.\n\nОшибка: `{repr(e)}`", parse_mode="Markdown")
+    if txt == "🎁 Пригласить друга":
+        if not await require_access(update, context):
+            return
+        await update.effective_message.reply_text(
+            "Вот твоя ссылка-приглашение. Нажми «Поделиться», чтобы отправить друзьям:",
+            reply_markup=share_keyboard(u.id),
+        )
         return
 
-    if awaiting == "vid_prompt":
-        prompt = update.message.text.strip()
-        context.user_data["awaiting"] = None
-        await update.message.reply_text("⏳ Генерирую видео (4 сек)…")
-        try:
-            vid_bytes = await run_in_thread(openai_create_video, prompt, "4", "720x1280")
-            # Telegram expects file-like object for video
-            bio = io.BytesIO(vid_bytes)
-            bio.name = "video.mp4"
-            await update.message.reply_video(video=bio, caption="🎬 Готово!")
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📌 Сохранить промт", callback_data="save_last")],
-            ])
-            context.user_data["last_prompt"] = prompt
-            await update.message.reply_text("Хочешь сохранить этот промт?", reply_markup=kb)
-        except Exception as e:
-            logger.exception("video gen failed")
-            await update.message.reply_text(
-                "⛔️ Не удалось сгенерировать видео.\n\n"
-                "Если текст ошибки про доступ/модель — значит у API-аккаунта нет доступа к Sora-видео.\n"
-                f"Ошибка: `{repr(e)}`",
-                parse_mode="Markdown"
+    if txt == "ℹ️ Помощь":
+        await help_cmd(update, context)
+        return
+
+    if txt == "⭐️ VIP / Подписка":
+        if not await require_access(update, context):
+            return
+        row = get_user(u.id)
+        text = (
+            "⭐️ VIP / Подписка\n\n"
+            f"VIP даёт до {VIP_DAILY_LIMIT} генераций в день на {VIP_DURATION_DAYS} дней.\n"
+            "Оплату/выдачу VIP можно сделать вручную: я отмечаю VIP в базе.\n\n"
+            "Если хочешь — добавлю оплату (ЮKassa/CloudPayments) отдельным шагом."
+        )
+        await update.effective_message.reply_text(text, reply_markup=main_menu())
+        return
+
+    if txt == "🎁 Промт дня":
+        if not await require_access(update, context):
+            return
+        # simple deterministic prompt-of-day
+        prompts = [
+            "Ультра-реалистичный fashion-портрет, морозные ресницы, 85mm, мягкий свет, 8K, кожа детальная.",
+            "Кинематографичный зимний кадр, лёгкий снег, объёмный свет, реалистичная текстура ткани, 4K.",
+            "Editorial-фото, минимализм, чистый фон, детализация кожи, натуральные поры, high-end retouch.",
+            "Reels-стиль: динамичный ракурс, лёгкий motion blur, реализм, естественные цвета, 4K.",
+        ]
+        idx = int(time.time() // 86400) % len(prompts)
+        await update.effective_message.reply_text(
+            f"🎁 Промт дня:\n\n{prompts[idx]}",
+            reply_markup=main_menu()
+        )
+        return
+
+    if txt == "📆 Челлендж 30 дней":
+        if not await require_access(update, context):
+            return
+        tasks = [
+            "День 1: Сделай 3 варианта одного портрета (разный свет).",
+            "День 2: Сделай один и тот же кадр в 3 ракурсах (close/mid/full).",
+            "День 3: Отработай кожу: поры/текстура/без пластика.",
+            "День 4: Снег/частицы: реалистичный snowfall и bokeh.",
+            "День 5: Outfit-замена без изменения лица.",
+        ]
+        day_idx = int(time.time() // 86400) % len(tasks)
+        await update.effective_message.reply_text(
+            f"📆 Челлендж:\n\n{tasks[day_idx]}\n\n"
+            "Хочешь — я добавлю все 30 дней и отмечание прогресса ✅",
+            reply_markup=main_menu()
+        )
+        return
+
+    # Free-form generation requires access
+    if not await require_access(update, context):
+        return
+
+    # If user typed a prompt after pressing generate buttons:
+    mode = context.user_data.get("mode")
+    if mode in ("image", "video") and txt:
+        row = get_user(u.id)
+        ok, msg = can_use_generation(row)
+        if not ok:
+            await update.effective_message.reply_text("⛔️ " + msg, reply_markup=main_menu())
+            context.user_data["mode"] = None
+            return
+
+        await update.effective_message.reply_text("⏳ Генерирую…")
+
+        if mode == "image":
+            img, err = openai_generate_image(txt)
+            if err:
+                await update.effective_message.reply_text(err, reply_markup=main_menu())
+            else:
+                consume_generation(row)
+                await update.effective_message.reply_photo(photo=img, caption="Готово ✅", reply_markup=main_menu())
+
+        else:
+            _, err = openai_generate_video_stub(txt)
+            await update.effective_message.reply_text(err, reply_markup=main_menu())
+
+        context.user_data["mode"] = None
+        return
+
+    # Otherwise show hint
+    await update.effective_message.reply_text(
+        "Напиши, что хочешь сделать, или выбери кнопку из меню 👇",
+        reply_markup=main_menu()
+    )
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    u = update.effective_user
+    ensure_user(u)
+
+    if query.data == "check_channel":
+        ok = await is_subscribed_to_channel(context.bot, u.id)
+        if ok:
+            await query.edit_message_text("✅ Канал подтверждён! Теперь подтвердим Instagram 👇",
+                                          reply_markup=instagram_gate_keyboard())
+        else:
+            await query.edit_message_text(
+                "Пока не вижу подписку 😔\n\nПодпишись и нажми «проверить» ещё раз.",
+                reply_markup=channel_gate_keyboard()
             )
         return
 
-    # default: show menu
-    await send_menu(update, context)
+    if query.data == "ig_request":
+        # create request record
+        with db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO ig_requests (user_id, ig_handle, note, created_at) VALUES (?, ?, ?, ?)",
+                (u.id, "", "requested via button", now_utc().isoformat())
+            )
+            conn.commit()
+
+        await query.edit_message_text(
+            "✅ Заявка создана.\n\n"
+            "Отправь мне одним сообщением:\n"
+            "1) твой @ник в Instagram\n"
+            "2) (желательно) скрин, где видно что ты подписан(а)\n\n"
+            "После подтверждения бот откроется полностью.",
+        )
+        # set waiting flag
+        context.user_data["await_ig_info"] = True
+        return
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    upsert_user(update)
+    u = update.effective_user
+    ensure_user(u)
 
-    awaiting = context.user_data.get("awaiting")
-    if awaiting != "photo_for_prompt":
-        await update.message.reply_text("Фото получил(а). Если хочешь промт по фото — нажми «Сделай промт по фото» в меню.")
+    # If waiting for IG proof
+    if context.user_data.get("await_ig_info"):
+        # store note that user sent photo proof
+        with db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO ig_requests (user_id, ig_handle, note, created_at) VALUES (?, ?, ?, ?)",
+                (u.id, "", "photo proof received", now_utc().isoformat())
+            )
+            conn.commit()
+
+        context.user_data["await_ig_info"] = False
+
+        await update.effective_message.reply_text(
+            "✅ Принято! Я подтвержу и открою доступ.\n\n"
+            "Если нужно быстрее — напиши мне в личку: “проверь IG в боте”."
+        )
+        # notify admin (if set)
+        if ADMIN_USER_ID:
+            try:
+                await context.bot.send_message(
+                    ADMIN_USER_ID,
+                    f"IG-заявка: user_id={u.id}, username=@{u.username}\n"
+                    f"Подтверди: /ig_ok {u.id}  |  Отклонить: /ig_no {u.id}"
+                )
+            except Exception:
+                pass
         return
 
-    if not await gate_or_menu(update, context):
+    if not await require_access(update, context):
         return
 
-    # download best resolution photo
-    photos = update.message.photo or []
-    if not photos:
-        await update.message.reply_text("Не вижу фото. Пришли обычным фото (не сжатым — лучше как документ).")
-        return
-    file_id = photos[-1].file_id
-    f = await context.bot.get_file(file_id)
-    b = await f.download_as_bytearray()
-
-    context.user_data["photo_bytes"] = bytes(b)
-    context.user_data["awaiting"] = "photo_goal"
-
-    await update.message.reply_text(
-        "✅ Фото принято.\n\nТеперь одним сообщением напиши:\n"
-        "1) что хочешь получить (Фото / Видео / HeyGen)\n"
-        "2) стиль (зима/глянец/кино/ночь)\n"
-        "3) важные детали (одежда/фон/эмоция)\n\n"
-        "Пример: *Видео, зима, я в красной шапке, мягкий кино-свет, реализм 1:1*",
-        parse_mode="Markdown"
+    await update.effective_message.reply_text(
+        "Фото получил ✅\n"
+        "Сейчас этот бот генерирует по тексту. Если хочешь “по фото” — скажи, "
+        "и я добавлю режим: загрузка фото → промт/оживление под Sora/Meta AI.",
+        reply_markup=main_menu()
     )
 
-async def on_photo_goal_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    upsert_user(update)
-
-    awaiting = context.user_data.get("awaiting")
-    if awaiting != "photo_goal":
+async def ig_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_USER_ID and update.effective_user.id != ADMIN_USER_ID:
         return
-
-    if not await gate_or_menu(update, context):
+    if not context.args:
+        await update.message.reply_text("Формат: /ig_ok <user_id>")
         return
-
-    goal = update.message.text.strip()
-    img_bytes = context.user_data.get("photo_bytes")
-    context.user_data["awaiting"] = None
-
-    await update.message.reply_text("⏳ Анализирую фото и собираю промт-пакет…")
+    uid = int(context.args[0])
+    with db() as conn:
+        conn.execute("UPDATE users SET ig_verified=1 WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM ig_requests WHERE user_id=?", (uid,))
+        conn.commit()
+    await update.message.reply_text(f"✅ IG подтвержден для {uid}")
     try:
-        pack = await run_in_thread(openai_prompt_from_photo, img_bytes, goal)
-        context.user_data["last_prompt"] = pack
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📌 Сохранить в мои промты", callback_data="save_last")]])
-        await update.message.reply_text(pack, reply_markup=kb)
-    except Exception as e:
-        logger.exception("prompt-by-photo failed")
-        await update.message.reply_text(
-            "⛔️ Не удалось сделать промт по фото.\n\n"
-            f"Ошибка: `{repr(e)}`",
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(uid, "✅ Instagram подтвержден! Доступ открыт 🎉", reply_markup=main_menu())
+    except Exception:
+        pass
 
-async def cb_save_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    uid = update.effective_user.id
-    if not await gate_or_menu(update, context):
+async def ig_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_USER_ID and update.effective_user.id != ADMIN_USER_ID:
         return
-
-    p = context.user_data.get("last_prompt")
-    if not p:
-        await q.message.reply_text("Нет последнего промта для сохранения.")
+    if not context.args:
+        await update.message.reply_text("Формат: /ig_no <user_id>")
         return
+    uid = int(context.args[0])
+    with db() as conn:
+        conn.execute("DELETE FROM ig_requests WHERE user_id=?", (uid,))
+        conn.commit()
+    await update.message.reply_text(f"❌ IG отклонен для {uid}")
+    try:
+        await context.bot.send_message(uid, "❌ Не получилось подтвердить Instagram. Пришли заявку ещё раз.")
+    except Exception:
+        pass
 
-    title = "Промт " + now_local().strftime("%d.%m %H:%M")
-    save_prompt(uid, title, p)
-    await q.message.reply_text("✅ Сохранено в «Мои промты».")
+async def vip_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_USER_ID and update.effective_user.id != ADMIN_USER_ID:
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Формат: /vip_add <user_id> [days]")
+        return
+    uid = int(context.args[0])
+    days = int(context.args[1]) if len(context.args) > 1 else VIP_DURATION_DAYS
+    until = now_utc() + timedelta(days=days)
+    with db() as conn:
+        conn.execute("UPDATE users SET vip_until=? WHERE user_id=?", (until.isoformat(), uid))
+        conn.commit()
+    await update.message.reply_text(f"⭐️ VIP выдан для {uid} до {until.isoformat()}")
+    try:
+        await context.bot.send_message(uid, f"⭐️ VIP активирован до {until.isoformat()} 🎉", reply_markup=main_menu())
+    except Exception:
+        pass
 
-# ----------------------------
-# App / Webhook
-# ----------------------------
-db_init()
+async def set_mode_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
+        return
+    context.user_data["mode"] = "image"
+    await update.effective_message.reply_text(
+        "🖼 Напиши описание для генерации фото.\n\n"
+        "Пример: «ультра-реалистичный зимний fashion-портрет, мягкий свет, 8K…»"
+    )
 
-app = FastAPI()
-tg_app: Application | None = None
+async def set_mode_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
+        return
+    context.user_data["mode"] = "video"
+    await update.effective_message.reply_text(
+        "🎬 Напиши описание для генерации видео.\n\n"
+        "⚠️ Видео работает только если у твоего API есть доступ к Sora."
+    )
 
-@app.api_route("/", methods=["GET", "HEAD"])
+# -------------------- FASTAPI ROUTES --------------------
+@app.get("/", response_class=PlainTextResponse)
 async def root():
-    return {"status": "ok"}
+    return "OK"
 
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, tg_app.bot)
-        await tg_app.process_update(update)
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        logger.exception("webhook error")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+@app.post(WEBHOOK_PATH)
+async def webhook(req: Request):
+    if tg_app is None:
+        return {"ok": False, "error": "bot not ready"}
+    data = await req.json()
+    update = Update.de_json(data, tg_app.bot)
+    await tg_app.process_update(update)
+    return {"ok": True}
 
+# -------------------- STARTUP/SHUTDOWN --------------------
+@app.on_event("startup")
 async def on_startup():
-    global tg_app
-    tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    global tg_app, BOT_USERNAME
 
-    tg_app.add_handler(CommandHandler("start", cmd_start))
-    tg_app.add_handler(CommandHandler("help", cmd_help))
-    tg_app.add_handler(CommandHandler("balance", cmd_balance))
-    tg_app.add_handler(CommandHandler("diag", cmd_diag))
-    tg_app.add_handler(CommandHandler("grantvip", cmd_grantvip))
+    init_db()
 
-    tg_app.add_handler(CallbackQueryHandler(cb_router))
-    tg_app.add_handler(CallbackQueryHandler(cb_save_last, pattern=r"^save_last$"))
+    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    tg_app.add_handler(CommandHandler("start", start_cmd))
+    tg_app.add_handler(CommandHandler("help", help_cmd))
+
+    # admin
+    tg_app.add_handler(CommandHandler("ig_ok", ig_ok))
+    tg_app.add_handler(CommandHandler("ig_no", ig_no))
+    tg_app.add_handler(CommandHandler("vip_add", vip_add))
+
+    # menu modes
+    tg_app.add_handler(MessageHandler(filters.Regex(r"^🖼 Сгенерировать фото$"), set_mode_image))
+    tg_app.add_handler(MessageHandler(filters.Regex(r"^🎬 Сгенерировать видео$"), set_mode_video))
+
+    tg_app.add_handler(CallbackQueryHandler(on_button))
     tg_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_photo_goal_text))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     await tg_app.initialize()
     await tg_app.start()
 
     me = await tg_app.bot.get_me()
-    logger.info(f"Bot username: {me.username}")
+    BOT_USERNAME = me.username
+    log.info("Bot username: %s", BOT_USERNAME)
 
-    await tg_app.bot.set_webhook(WEBHOOK_URL)
-    logger.info(f"Webhook set: {WEBHOOK_URL}")
+    # Set webhook if base url exists
+    if WEBHOOK_BASE:
+        url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
+        await tg_app.bot.set_webhook(url)
+        log.info("Webhook set: %s", url)
+    else:
+        log.warning("WEBHOOK_URL/RENDER_EXTERNAL_URL not set. Webhook NOT configured.")
 
+@app.on_event("shutdown")
 async def on_shutdown():
+    global tg_app
     if tg_app:
         await tg_app.stop()
         await tg_app.shutdown()
-
-@app.on_event("startup")
-async def _startup():
-    await on_startup()
-
-@app.on_event("shutdown")
-async def _shutdown():
-    await on_shutdown()
